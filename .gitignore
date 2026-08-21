@@ -52,3 +52,4 @@ modules/*/ios/build/
 # Local assistant instructions — kept on disk, not published
 CLAUDE.md
 AGENTS.md
+.claude/
