@@ -13,6 +13,18 @@ React Native · Expo SDK 57 · TypeScript (strict) · SQLite · a hand-written K
 
 ---
 
+<!--
+SCREENSHOTS — delete this comment marker (this line and the closing one below)
+once the four PNGs are in docs/screenshots/. See docs/screenshots/README.md.
+
+## Screenshots
+
+| Home | Review | Rules | Categories |
+| --- | --- | --- | --- |
+| <img src="docs/screenshots/home.png" width="200" alt="Spending summary for the month, broken down by category"> | <img src="docs/screenshots/review.png" width="200" alt="Captured transactions waiting for a one-tap confirm"> | <img src="docs/screenshots/rules.png" width="200" alt="Editing a category rule"> | <img src="docs/screenshots/categories.png" width="200" alt="Adding a custom category"> |
+
+-->
+
 ## Why this exists
 
 Manual expense apps fail because you forget. Hisab Kitab inverts that: the phone already knows about
