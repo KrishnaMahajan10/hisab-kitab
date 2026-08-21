@@ -48,3 +48,7 @@ modules/*/android/build/
 modules/*/android/.gradle/
 modules/*/android/.cxx/
 modules/*/ios/build/
+
+# Local assistant instructions — kept on disk, not published
+CLAUDE.md
+AGENTS.md
