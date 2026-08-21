@@ -1,16 +1,31 @@
 import { useCallback, useEffect, useState } from 'react';
-import { RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import {
+  Alert,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 import { useSQLiteContext } from 'expo-sqlite';
 
 import { Badge, Button, Card, ChipGrid, ChipRow, EmptyState } from '../components/ui';
 import { useCategories } from '../categories';
+import { SplitPicker } from '../components/SplitPicker';
+import { sharesTotal, type Shares } from '../splits';
 import {
   confirmTransaction,
+  deleteAllPending,
   deleteTransaction,
   learnRule,
   listAccounts,
+  listPeople,
+  listSplitsForTransaction,
+  replaceSplits,
   listPending,
   type Account,
+  type Person,
   type TransactionWithAccount,
 } from '../db/repo';
 import { displayTitle, originBadge } from '../labels';
@@ -26,6 +41,7 @@ function orderWithSelectedFirst(options: readonly string[], selected: string): s
 type Draft = {
   category: string;
   accountId: number | null;
+  shares: Shares;
   title: string;
   merchant: string;
   note: string;
@@ -38,13 +54,32 @@ export default function ReviewScreen({ onChanged }: { onChanged: () => void }) {
   const categories = useCategories();
   const [pending, setPending] = useState<TransactionWithAccount[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [people, setPeople] = useState<Person[]>([]);
   const [drafts, setDrafts] = useState<Record<number, Draft>>({});
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
-    const [rows, accountRows] = await Promise.all([listPending(db), listAccounts(db)]);
+    const [rows, accountRows, peopleRows] = await Promise.all([
+      listPending(db),
+      listAccounts(db),
+      listPeople(db),
+    ]);
     setPending(rows);
     setAccounts(accountRows);
+    setPeople(peopleRows.filter((person) => !person.archived));
+
+    // A split made before confirming has to survive a refresh, so it is read
+    // back rather than reset to empty.
+    const stored = new Map<number, Shares>();
+    for (const row of rows) {
+      const splits = await listSplitsForTransaction(db, row.id);
+      if (splits.length === 0) continue;
+      const shares: Shares = {};
+      for (const split of splits) {
+        if (split.direction === 'owed_to_me') shares[split.personId] = split.amountPaise;
+      }
+      stored.set(row.id, shares);
+    }
     setDrafts((previous) => {
       const next: Record<number, Draft> = {};
       for (const row of rows) {
@@ -52,6 +87,7 @@ export default function ReviewScreen({ onChanged }: { onChanged: () => void }) {
           previous[row.id] ?? {
             category: row.category,
             accountId: row.account_id,
+            shares: stored.get(row.id) ?? {},
             title: row.title ?? '',
             merchant: row.merchant ?? '',
             note: row.note ?? '',
@@ -81,6 +117,17 @@ export default function ReviewScreen({ onChanged }: { onChanged: () => void }) {
     const draft = drafts[row.id];
     if (!draft) return;
 
+    // Splits are written before the row leaves the queue, so confirming never
+    // loses a share that was set here.
+    await replaceSplits(
+      db,
+      row.id,
+      Object.entries(draft.shares).map(([personId, amountPaise]) => ({
+        personId: Number(personId),
+        amountPaise,
+        direction: 'owed_to_me' as const,
+      }))
+    );
     const merchant = draft.merchant.trim() || null;
     await confirmTransaction(db, row.id, {
       accountId: draft.accountId,
@@ -105,6 +152,15 @@ export default function ReviewScreen({ onChanged }: { onChanged: () => void }) {
     for (const row of pending) {
       const draft = drafts[row.id];
       if (!draft) continue;
+      await replaceSplits(
+        db,
+        row.id,
+        Object.entries(draft.shares).map(([personId, amountPaise]) => ({
+          personId: Number(personId),
+          amountPaise,
+          direction: 'owed_to_me' as const,
+        }))
+      );
       await confirmTransaction(db, row.id, {
         accountId: draft.accountId,
         category: draft.category,
@@ -117,6 +173,32 @@ export default function ReviewScreen({ onChanged }: { onChanged: () => void }) {
     }
     await load();
     onChanged();
+  };
+
+  /**
+   * Clearing the queue throws away captured transactions, so it names the
+   * number and asks. Nothing here is recoverable — the native capture queue
+   * has already been drained by this point.
+   */
+  const discardAll = () => {
+    Alert.alert(
+      `Discard all ${pending.length}?`,
+      'These transactions will not be recorded, and re-scanning will not bring them back.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: `Discard ${pending.length}`,
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              await deleteAllPending(db);
+              await load();
+              onChanged();
+            })();
+          },
+        },
+      ]
+    );
   };
 
   const discard = async (id: number) => {
@@ -143,7 +225,10 @@ export default function ReviewScreen({ onChanged }: { onChanged: () => void }) {
             <Text style={[styles.count, { color: theme.text }]}>
               {pending.length} to review
             </Text>
-            <Button label="Confirm all" tone="primary" onPress={confirmAll} />
+            <View style={styles.bulkRow}>
+              <Button label="Discard all" tone="danger" onPress={discardAll} />
+              <Button label="Confirm all" tone="primary" onPress={confirmAll} />
+            </View>
           </View>
 
           {pending.map((row) => {
@@ -164,6 +249,9 @@ export default function ReviewScreen({ onChanged }: { onChanged: () => void }) {
                     {formatMoney(row.amount_paise)}
                   </Text>
                   <View style={styles.badges}>
+                    {sharesTotal(draft.shares) > 0 ? (
+                      <Badge label="SPLIT" tone="muted" />
+                    ) : null}
                     <Badge label={originBadge(row)} />
                     {lowConfidence ? <Badge label="CHECK" tone="warn" /> : null}
                   </View>
@@ -229,6 +317,15 @@ export default function ReviewScreen({ onChanged }: { onChanged: () => void }) {
                         },
                       ]}
                     />
+
+                    {row.direction === 'debit' ? (
+                      <SplitPicker
+                        people={people}
+                        shares={draft.shares}
+                        amountPaise={row.amount_paise}
+                        onChange={(next) => patchDraft(row.id, { shares: next })}
+                      />
+                    ) : null}
 
                     <Text style={[styles.label, { color: theme.textMuted }]}>Account</Text>
                     <ChipRow
@@ -303,6 +400,7 @@ const styles = StyleSheet.create({
   amount: { fontSize: 24, fontWeight: '700' },
   badges: { flexDirection: 'row', gap: spacing.xs },
   merchant: { fontSize: 16, fontWeight: '600', marginTop: spacing.sm },
+  bulkRow: { flexDirection: 'row', gap: spacing.sm },
   meta: { fontSize: 12, marginTop: 2, marginBottom: spacing.sm },
   expanded: { gap: spacing.xs, marginTop: spacing.md },
   label: { fontSize: 11, fontWeight: '700', letterSpacing: 0.5, marginTop: spacing.sm },

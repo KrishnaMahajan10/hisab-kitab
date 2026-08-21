@@ -7,6 +7,7 @@ import {
   parseCapture,
   NEAR_DUPLICATE_WINDOW_MS,
   referencesMatch,
+  statementSupersedes,
 } from './parse';
 
 let failures = 0;
@@ -226,6 +227,35 @@ check('a UPI self-transfer is caught with no NEFT or IMPS wording',
 const toFriend = parseCapture(capture('Rs.30000 debited from A/c XX1234 credited to A/c XX7777 via IMPS'))!;
 check('IMPS wording alone does not make it yours',
   !isSelfTransfer(toFriend.allLast4, mine));
+
+console.log('\nA statement replacing a pending SMS request\n');
+
+const smsRow = { status: 'pending' as const, source: 'sms' as const, raw_sender: 'HDFCBK' };
+const notifRow = { status: 'pending' as const, source: 'notification' as const, raw_sender: 'com.phonepe.app' };
+const stmtRow = { status: 'pending' as const, source: 'manual' as const, raw_sender: 'statement:table' };
+const withRef = { reference: '659315937795' };
+const withoutRef = { reference: null };
+
+check('a pending SMS request is replaced when the reference matches',
+  statementSupersedes(smsRow, withRef));
+check('a pending notification is replaced too',
+  statementSupersedes(notifRow, withRef));
+
+// A reviewed row carries the user's own category, title and account. Re-importing
+// a statement must never quietly undo those.
+check('a confirmed row is never replaced',
+  !statementSupersedes({ ...smsRow, status: 'confirmed' }, withRef));
+
+// Without a reference the match came from amount, time and merchant. That is
+// good enough to skip a duplicate, not good enough to delete something.
+check('no reference means no replacement',
+  !statementSupersedes(smsRow, withoutRef));
+
+// Importing the same file twice must not churn its own rows.
+check('a statement does not replace another statement row',
+  !statementSupersedes(stmtRow, withRef));
+check('a manual entry is replaced, since it has no reference of its own',
+  statementSupersedes({ status: 'pending', source: 'manual', raw_sender: null }, withRef));
 
 console.log(failures === 0 ? '\nAll assertions passed\n' : `\n${failures} assertion(s) failed\n`);
 process.exit(failures === 0 ? 0 : 1);

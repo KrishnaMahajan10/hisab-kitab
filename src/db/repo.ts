@@ -7,6 +7,7 @@ import {
   type RuleField,
 } from '../parse/categorize';
 import { captureOrigin, type CaptureOrigin } from '../labels';
+import type { SplitDirection } from '../splits';
 import {
   CROSS_SOURCE_WINDOW_MS,
   isSamePayment,
@@ -54,22 +55,31 @@ export type TransactionWithAccount = Transaction & { account_name: string | null
 // choice, so the totals read it from the table instead of a fixed list.
 const MOVED = '(SELECT name FROM categories WHERE money_moved = 1)';
 
+// What you lent out on a payment: the shares you assigned to someone else.
+// Subtracted from spending whether or not they have paid you back, because the
+// money was never yours to spend.
+const LENT = (id: string): string => `COALESCE((SELECT SUM(amount_paise) FROM splits
+                 WHERE transaction_id = ${id} AND direction = 'owed_to_me'), 0)`;
+
 /**
- * Spending, income and the moved-but-not-spent total, all read from one pass so
- * the three always agree. The category test lives inside each CASE rather than
- * in the WHERE clause so the entry count still covers every row in the period.
+ * Spending, income, the moved-but-not-spent total and the amount fronted for
+ * other people, all read from one pass so the four always agree. The category
+ * test lives inside each CASE rather than in the WHERE clause so the entry count
+ * still covers every row in the period.
  */
 function totalsSelect(prefix = ''): string {
   const category = `${prefix}category`;
   const amount = `${prefix}amount_paise`;
   const direction = `${prefix}direction`;
+  const lent = LENT(`${prefix}id`);
   return `COUNT(*) AS n,
             SUM(CASE WHEN ${direction} = 'debit'  AND ${category} NOT IN ${MOVED}
-                     THEN ${amount} ELSE 0 END) AS spent,
+                     THEN ${amount} - ${lent} ELSE 0 END) AS spent,
             SUM(CASE WHEN ${direction} = 'credit' AND ${category} NOT IN ${MOVED}
                      THEN ${amount} ELSE 0 END) AS earned,
             SUM(CASE WHEN ${direction} = 'debit'  AND ${category} IN ${MOVED}
-                     THEN ${amount} ELSE 0 END) AS moved`;
+                     THEN ${amount} ELSE 0 END) AS moved,
+            SUM(CASE WHEN ${direction} = 'debit' THEN ${lent} ELSE 0 END) AS lent`;
 }
 
 export async function listAccounts(db: SQLiteDatabase): Promise<Account[]> {
@@ -147,7 +157,7 @@ export async function insertTransaction(
     dedupKey: string;
     reference?: string | null;
   }
-): Promise<boolean> {
+): Promise<number | null> {
   const result = await db.runAsync(
     `INSERT OR IGNORE INTO transactions
        (account_id, amount_paise, direction, title, merchant, category, occurred_at, note,
@@ -172,7 +182,10 @@ export async function insertTransaction(
       Date.now(),
     ]
   );
-  return result.changes > 0;
+  // The new row's id, or null when the unique dedup key already existed and the
+  // insert was ignored. Callers need the id to attach splits to what they just
+  // created.
+  return result.changes > 0 ? result.lastInsertRowId : null;
 }
 
 export async function findNearDuplicate(
@@ -352,13 +365,14 @@ export async function listHistory(
 export async function historySummary(
   db: SQLiteDatabase,
   filter: Omit<HistoryFilter, 'limit' | 'offset'>
-): Promise<{ count: number; spent: number; earned: number; moved: number }> {
+): Promise<{ count: number; spent: number; earned: number; moved: number; lent: number }> {
   const where = buildHistoryWhere(filter);
   const row = await db.getFirstAsync<{
     n: number;
     spent: number | null;
     earned: number | null;
     moved: number | null;
+    lent: number | null;
   }>(
     `SELECT ${totalsSelect('t.')}
        FROM transactions t
@@ -370,6 +384,7 @@ export async function historySummary(
     spent: row?.spent ?? 0,
     earned: row?.earned ?? 0,
     moved: row?.moved ?? 0,
+    lent: row?.lent ?? 0,
   };
 }
 
@@ -660,6 +675,7 @@ export type RangeSummary = {
   spent: number;
   earned: number;
   moved: number;
+  lent: number;
   byCategory: Array<{ category: string; total: number }>;
   byAccount: Array<{ account_name: string | null; total: number }>;
 };
@@ -695,6 +711,7 @@ export async function rangeSummary(
     spent: number | null;
     earned: number | null;
     moved: number | null;
+    lent: number | null;
   }>(
     `SELECT ${totalsSelect()}
        FROM transactions
@@ -705,7 +722,7 @@ export async function rangeSummary(
   // The breakdowns answer "where did my money go", so a relocation of your own
   // money would only crowd out the categories you actually spent in.
   const byCategory = await db.getAllAsync<{ category: string; total: number }>(
-    `SELECT category, SUM(amount_paise) AS total
+    `SELECT category, SUM(amount_paise - ${LENT('id')}) AS total
        FROM transactions
       WHERE status = 'confirmed'
         AND direction = 'debit'
@@ -716,7 +733,7 @@ export async function rangeSummary(
   );
 
   const byAccount = await db.getAllAsync<{ account_name: string | null; total: number }>(
-    `SELECT a.name AS account_name, SUM(t.amount_paise) AS total
+    `SELECT a.name AS account_name, SUM(t.amount_paise - ${LENT('t.id')}) AS total
        FROM transactions t
        LEFT JOIN accounts a ON a.id = t.account_id
       WHERE t.status = 'confirmed'
@@ -732,6 +749,7 @@ export async function rangeSummary(
     spent: totals?.spent ?? 0,
     earned: totals?.earned ?? 0,
     moved: totals?.moved ?? 0,
+    lent: totals?.lent ?? 0,
     byCategory,
     byAccount,
   };
@@ -917,4 +935,226 @@ export async function deleteCategory(db: SQLiteDatabase, id: number): Promise<vo
     throw new Error('This category is still in use — hide it instead.');
   }
   await db.runAsync('DELETE FROM categories WHERE id = ?', [id]);
+}
+
+/**
+ * Deletes many transactions in one transaction, so a bulk delete either lands
+ * completely or not at all rather than leaving half the selection gone.
+ */
+export async function deleteTransactions(
+  db: SQLiteDatabase,
+  ids: readonly number[]
+): Promise<number> {
+  if (ids.length === 0) return 0;
+
+  let deleted = 0;
+  await db.withTransactionAsync(async () => {
+    // Chunked so a large selection cannot exceed SQLite's variable limit.
+    for (let start = 0; start < ids.length; start += 400) {
+      const chunk = ids.slice(start, start + 400);
+      const placeholders = chunk.map(() => '?').join(',');
+      const result = await db.runAsync(
+        `DELETE FROM transactions WHERE id IN (${placeholders})`,
+        chunk as number[]
+      );
+      deleted += result.changes;
+    }
+  });
+  return deleted;
+}
+
+export async function deleteAllPending(db: SQLiteDatabase): Promise<number> {
+  const result = await db.runAsync("DELETE FROM transactions WHERE status = 'pending'");
+  return result.changes;
+}
+
+/**
+ * The ids a history filter currently matches, ignoring paging — so "select all"
+ * can cover rows the user has not scrolled to yet.
+ */
+export async function listHistoryIds(
+  db: SQLiteDatabase,
+  filter: Omit<HistoryFilter, 'limit' | 'offset'>
+): Promise<number[]> {
+  const where = buildHistoryWhere(filter);
+  const rows = await db.getAllAsync<{ id: number }>(
+    `SELECT t.id FROM transactions t WHERE ${where.sql}`,
+    where.params
+  );
+  return rows.map((row) => row.id);
+}
+
+export type Person = { id: number; name: string; archived: boolean };
+
+export async function listPeople(db: SQLiteDatabase): Promise<Person[]> {
+  const rows = await db.getAllAsync<{ id: number; name: string; archived: number }>(
+    'SELECT id, name, archived FROM people ORDER BY archived, name'
+  );
+  return rows.map((row) => ({ id: row.id, name: row.name, archived: row.archived !== 0 }));
+}
+
+export async function createPerson(db: SQLiteDatabase, name: string): Promise<number> {
+  const clean = name.replace(/\s+/g, ' ').trim();
+  if (!clean) throw new Error('A name is needed');
+  const result = await db.runAsync(
+    'INSERT INTO people (name, created_at) VALUES (?, ?)',
+    [clean, Date.now()]
+  );
+  return result.lastInsertRowId;
+}
+
+export async function renamePerson(
+  db: SQLiteDatabase,
+  id: number,
+  name: string
+): Promise<void> {
+  const clean = name.replace(/\s+/g, ' ').trim();
+  if (!clean) throw new Error('A name is needed');
+  await db.runAsync('UPDATE people SET name = ? WHERE id = ?', [clean, id]);
+}
+
+/**
+ * Removes a person only when nothing is outstanding with them. Deleting cascades
+ * to their splits, which would silently rewrite what you actually spent on those
+ * payments, so an unsettled balance blocks it.
+ */
+export async function deletePerson(db: SQLiteDatabase, id: number): Promise<void> {
+  const open = await db.getFirstAsync<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM splits WHERE person_id = ? AND settled_at IS NULL',
+    [id]
+  );
+  if ((open?.n ?? 0) > 0) {
+    throw new Error('Settle up with this person first, or hide them instead.');
+  }
+  await db.runAsync('DELETE FROM people WHERE id = ?', [id]);
+}
+
+export async function setPersonArchived(
+  db: SQLiteDatabase,
+  id: number,
+  archived: boolean
+): Promise<void> {
+  await db.runAsync('UPDATE people SET archived = ? WHERE id = ?', [archived ? 1 : 0, id]);
+}
+
+export type SplitRecord = {
+  id: number;
+  transactionId: number;
+  personId: number;
+  personName: string;
+  amountPaise: number;
+  direction: SplitDirection;
+  settled: boolean;
+};
+
+type SplitRowRaw = {
+  id: number;
+  transaction_id: number;
+  person_id: number;
+  person_name: string;
+  amount_paise: number;
+  direction: SplitDirection;
+  settled_at: number | null;
+};
+
+function toSplit(row: SplitRowRaw): SplitRecord {
+  return {
+    id: row.id,
+    transactionId: row.transaction_id,
+    personId: row.person_id,
+    personName: row.person_name,
+    amountPaise: row.amount_paise,
+    direction: row.direction,
+    settled: row.settled_at !== null,
+  };
+}
+
+const SPLIT_SELECT = `
+  SELECT s.id, s.transaction_id, s.person_id, p.name AS person_name,
+         s.amount_paise, s.direction, s.settled_at
+    FROM splits s
+    JOIN people p ON p.id = s.person_id`;
+
+export async function listSplitsForTransaction(
+  db: SQLiteDatabase,
+  transactionId: number
+): Promise<SplitRecord[]> {
+  const rows = await db.getAllAsync<SplitRowRaw>(
+    `${SPLIT_SELECT} WHERE s.transaction_id = ? ORDER BY p.name`,
+    [transactionId]
+  );
+  return rows.map(toSplit);
+}
+
+export async function listAllSplits(db: SQLiteDatabase): Promise<SplitRecord[]> {
+  const rows = await db.getAllAsync<SplitRowRaw>(`${SPLIT_SELECT} ORDER BY s.created_at DESC`);
+  return rows.map(toSplit);
+}
+
+/**
+ * Replaces the splits on one transaction. Rewriting rather than merging keeps the
+ * editor honest: what you see in the sheet is exactly what ends up stored, with
+ * no leftovers from a share you removed.
+ */
+export async function replaceSplits(
+  db: SQLiteDatabase,
+  transactionId: number,
+  shares: ReadonlyArray<{ personId: number; amountPaise: number; direction: SplitDirection }>
+): Promise<void> {
+  await db.withTransactionAsync(async () => {
+    // Settlement dates are worth keeping across an edit, so they are read back
+    // and reapplied to any share for the same person and direction.
+    const previous = await db.getAllAsync<{
+      person_id: number;
+      direction: SplitDirection;
+      settled_at: number | null;
+    }>(
+      'SELECT person_id, direction, settled_at FROM splits WHERE transaction_id = ?',
+      [transactionId]
+    );
+    const settledBefore = new Map(
+      previous
+        .filter((row) => row.settled_at !== null)
+        .map((row) => [`${row.person_id}|${row.direction}`, row.settled_at])
+    );
+
+    await db.runAsync('DELETE FROM splits WHERE transaction_id = ?', [transactionId]);
+
+    for (const share of shares) {
+      if (share.amountPaise <= 0) continue;
+      await db.runAsync(
+        `INSERT INTO splits
+           (transaction_id, person_id, amount_paise, direction, settled_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          transactionId,
+          share.personId,
+          share.amountPaise,
+          share.direction,
+          settledBefore.get(`${share.personId}|${share.direction}`) ?? null,
+          Date.now(),
+        ]
+      );
+    }
+  });
+}
+
+export async function setSplitSettled(
+  db: SQLiteDatabase,
+  id: number,
+  settled: boolean
+): Promise<void> {
+  await db.runAsync('UPDATE splits SET settled_at = ? WHERE id = ?', [
+    settled ? Date.now() : null,
+    id,
+  ]);
+}
+
+/** Marks everything outstanding with one person as settled, in one go. */
+export async function settleUpWith(db: SQLiteDatabase, personId: number): Promise<number> {
+  const result = await db.runAsync(
+    'UPDATE splits SET settled_at = ? WHERE person_id = ? AND settled_at IS NULL',
+    [Date.now(), personId]
+  );
+  return result.changes;
 }

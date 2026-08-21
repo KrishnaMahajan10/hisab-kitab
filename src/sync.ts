@@ -111,7 +111,7 @@ export async function drainCaptures(db: SQLiteDatabase): Promise<DrainResult> {
           amountPaise: parsed.amountPaise,
         });
 
-    const inserted = await insertTransaction(db, {
+    const insertedId = await insertTransaction(db, {
       accountId,
       amountPaise: parsed.amountPaise,
       direction: parsed.direction,
@@ -127,7 +127,7 @@ export async function drainCaptures(db: SQLiteDatabase): Promise<DrainResult> {
       reference: parsed.reference,
     });
 
-    if (inserted) imported += 1;
+    if (insertedId !== null) imported += 1;
     else skipped += 1;
   }
 

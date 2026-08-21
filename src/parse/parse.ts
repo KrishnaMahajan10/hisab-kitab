@@ -1,5 +1,5 @@
 import type { RawCapture } from '../../modules/hisab-capture';
-import type { CaptureOrigin } from '../labels';
+import { captureOrigin, type CaptureOrigin } from '../labels';
 
 export type Direction = 'debit' | 'credit';
 
@@ -363,3 +363,35 @@ export function parseCapture(capture: RawCapture): ParsedTransaction | null {
     reference: extractReference(text),
   };
 }
+
+/** The parts of a stored row that decide whether a statement outranks it. */
+export type CapturedRow = {
+  status: 'pending' | 'confirmed';
+  source: 'sms' | 'notification' | 'manual';
+  raw_sender: string | null;
+};
+/**
+ * Whether an imported statement row should take the place of a row already
+ * captured from a message.
+ *
+ * A statement is the bank's own record: the amount is exact, the payee is spelled
+ * in full, and the reference is complete rather than a fragment quoted in an SMS.
+ * So when the same payment is sitting in the review queue, the statement version
+ * replaces it and the review request disappears.
+ *
+ * A row that has already been reviewed is never touched. The category, title and
+ * account on it are the user's decisions, and re-importing a statement must not
+ * quietly undo them.
+ */
+export function statementSupersedes(
+  existing: CapturedRow,
+  row: { reference: string | null }
+): boolean {
+  if (existing.status !== 'pending') return false;
+  // Another statement import is not better information, just the same file again.
+  if (captureOrigin(existing) === 'statement') return false;
+  // Without a reference the match was a heuristic, and a heuristic is not strong
+  // enough to justify deleting something.
+  return row.reference !== null;
+}
+

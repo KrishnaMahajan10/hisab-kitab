@@ -5,6 +5,7 @@ import DateTimePicker from '@react-native-community/datetimepicker';
 import { Ionicons } from '@expo/vector-icons';
 
 import { useCategories } from '../categories';
+import { usePreferences } from '../preferences';
 import { DEFAULT_FILTERS, rangeOf, SOURCE_FILTERS, type HistoryFilters } from '../filters';
 import { PERIODS, recentMonths } from '../period';
 import { formatDate, spacing, useTheme } from '../theme';
@@ -26,6 +27,7 @@ export function FilterSheet({
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const categories = useCategories();
+  const { cycleStartDay } = usePreferences();
   const [draft, setDraft] = useState<HistoryFilters>(initial);
   const [picker, setPicker] = useState<'from' | 'to' | null>(null);
 
@@ -49,7 +51,7 @@ export function FilterSheet({
         : [...previous.categories, category],
     }));
 
-  const draftRange = rangeOf(draft);
+  const draftRange = rangeOf(draft, new Date(), cycleStartDay);
   const months = useMemo(() => recentMonths(new Date()), []);
   const fallbackFrom = draft.customFrom ?? draftRange.from ?? Date.now();
   const fallbackTo = draft.customTo ?? (draftRange.to ?? Date.now()) - DAY_MS;

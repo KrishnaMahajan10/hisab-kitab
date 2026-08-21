@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  Linking,
   PermissionsAndroid,
   Platform,
   ScrollView,
@@ -37,8 +38,11 @@ import {
 } from '../backup';
 import { importStatementFile, STATEMENT_MIME_TYPES } from '../import/statement';
 import CategoriesScreen from './CategoriesScreen';
+import PeopleScreen from './PeopleScreen';
 import RulesScreen from './RulesScreen';
 import { backfillLastDays } from '../sync';
+import { periodRange } from '../period';
+import { MAX_CYCLE_START_DAY, usePreferences } from '../preferences';
 import { formatMoney, spacing, useTheme } from '../theme';
 
 const ACCOUNT_KINDS: readonly AccountKind[] = [
@@ -52,6 +56,7 @@ const ACCOUNT_KINDS: readonly AccountKind[] = [
 export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
   const db = useSQLiteContext();
   const theme = useTheme();
+  const { cycleStartDay, setCycleStartDay } = usePreferences();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [smsGranted, setSmsGranted] = useState(false);
   const [notifAccess, setNotifAccess] = useState(false);
@@ -65,6 +70,8 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
   const [driveLastBackup, setDriveLastBackup] = useState<string | null>(null);
   const [showRules, setShowRules] = useState(false);
   const [showCategories, setShowCategories] = useState(false);
+  const [showPeople, setShowPeople] = useState(false);
+  const [cycleDraft, setCycleDraft] = useState('');
 
   const refreshStatus = useCallback(async () => {
     setAccounts(await listAccounts(db));
@@ -83,13 +90,72 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
     void refreshStatus();
   }, [refreshStatus]);
 
+  useEffect(() => {
+    setCycleDraft(String(cycleStartDay));
+  }, [cycleStartDay]);
+
+  /**
+   * Android stops showing the prompt once it has been denied twice, and on
+   * Android 13+ it refuses outright for apps installed outside the Play Store
+   * until restricted settings are unblocked. Either way the request returns
+   * quietly, so without this the button looks broken. Send the user to the one
+   * screen where the permission can still be granted.
+   */
   const requestSms = async () => {
     if (Platform.OS !== 'android') return;
-    await PermissionsAndroid.requestMultiple([
+
+    const result = await PermissionsAndroid.requestMultiple([
       PermissionsAndroid.PERMISSIONS.READ_SMS,
       PermissionsAndroid.PERMISSIONS.RECEIVE_SMS,
     ]);
     await refreshStatus();
+
+    const outcomes = Object.values(result);
+    if (outcomes.every((outcome) => outcome === 'granted')) return;
+
+    const blocked = outcomes.some((outcome) => outcome === 'never_ask_again');
+    Alert.alert(
+      blocked ? 'Android is blocking this' : 'SMS access not granted',
+      blocked
+        ? 'Android will not ask again, so it has to be turned on by hand:\n\n' +
+            '1. Open app settings below\n' +
+            '2. Tap Permissions, then SMS, then Allow\n\n' +
+            'If SMS is greyed out, tap the three dots at the top of the app info ' +
+            'screen and choose "Allow restricted settings" first. Android does this ' +
+            'to apps installed outside the Play Store.'
+        : 'Without SMS access, transactions can only be captured from payment app notifications.',
+      blocked
+        ? [
+            { text: 'Not now', style: 'cancel' },
+            { text: 'Open app settings', onPress: () => void Linking.openSettings() },
+          ]
+        : [{ text: 'OK' }]
+    );
+  };
+
+  // Shows the cycle the current setting produces, so the effect of the number
+  // is visible before it is trusted with the totals.
+  const cycleHint = useMemo(() => {
+    const range = periodRange('Month', new Date(), null, null, null, cycleStartDay);
+    return cycleStartDay === 1
+      ? `Calendar month — currently ${range.label}`
+      : `This month runs ${range.label}`;
+  }, [cycleStartDay]);
+
+  const saveCycleDay = async () => {
+    const day = Number.parseInt(cycleDraft, 10);
+    if (!Number.isFinite(day) || day < 1 || day > MAX_CYCLE_START_DAY) {
+      Alert.alert(
+        'Pick a day between 1 and ' + MAX_CYCLE_START_DAY,
+        'Later days are not offered because they do not exist in February, and a cycle that ' +
+          'silently moves month to month would make your totals hard to trust.'
+      );
+      setCycleDraft(String(cycleStartDay));
+      return;
+    }
+    if (day === cycleStartDay) return;
+    await setCycleStartDay(day);
+    onChanged();
   };
 
   const requestNotifications = async () => {
@@ -132,6 +198,11 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
       setPdfPassword('');
       onChanged();
       const parts = [`${outcome.imported} transactions queued for review.`];
+      if (outcome.replaced > 0) {
+        parts.push(
+          `${outcome.replaced} replaced an SMS entry with the same transaction ID, so those review requests are gone.`
+        );
+      }
       if (outcome.duplicates > 0) {
         parts.push(`${outcome.duplicates} skipped as already recorded.`);
       }
@@ -311,6 +382,10 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
     return <RulesScreen onChanged={onChanged} onBack={() => setShowRules(false)} />;
   }
 
+  if (showPeople) {
+    return <PeopleScreen onChanged={onChanged} onBack={() => setShowPeople(false)} />;
+  }
+
   if (showCategories) {
     return (
       <CategoriesScreen onChanged={onChanged} onBack={() => setShowCategories(false)} />
@@ -458,6 +533,49 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
           label="Add account"
           tone="primary"
           onPress={() => void addAccount()}
+          style={styles.spaced}
+        />
+      </Card>
+
+      <SectionTitle>Shared payments</SectionTitle>
+      <Card>
+        <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+          When you pay for a group, split the payment in History and only your share counts as
+          spending. This page shows who still owes you, and what you owe.
+        </Text>
+        <Button
+          label="People"
+          onPress={() => setShowPeople(true)}
+          style={styles.spaced}
+        />
+      </Card>
+
+      <SectionTitle>Monthly cycle</SectionTitle>
+      <Card>
+        <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+          If your money arrives on a particular day, set it here and every monthly total will
+          follow that cycle instead of the calendar month. Salary on the 7th means a month runs
+          from the 7th to the 6th.
+        </Text>
+        <Text style={[styles.label, { color: theme.textMuted }]}>
+          Month starts on day (1–{MAX_CYCLE_START_DAY})
+        </Text>
+        <TextInput
+          value={cycleDraft}
+          onChangeText={setCycleDraft}
+          onBlur={() => void saveCycleDay()}
+          keyboardType="number-pad"
+          maxLength={2}
+          style={[
+            styles.input,
+            { color: theme.text, backgroundColor: theme.surfaceAlt, borderColor: theme.border },
+          ]}
+        />
+        <Text style={[styles.rowMeta, { color: theme.textMuted }]}>{cycleHint}</Text>
+        <Button
+          label="Save cycle"
+          onPress={() => void saveCycleDay()}
+          disabled={busy}
           style={styles.spaced}
         />
       </Card>

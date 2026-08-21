@@ -3,7 +3,7 @@ import type { SQLiteDatabase } from 'expo-sqlite';
 import { extractReference } from '../parse/parse';
 
 export const DATABASE_NAME = 'hisab.db';
-const DATABASE_VERSION = 7;
+const DATABASE_VERSION = 8;
 
 export const EXPENSE_CATEGORIES = [
   'Food & Dining',
@@ -308,6 +308,44 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
       );
       order += 1;
     }
+  }
+
+  if (current < 8) {
+    // Paying for a group and being paid back later is not spending. Splits
+    // record whose share of a payment was never really yours, so the totals can
+    // count your share and the balances can show who still owes what.
+    await db.execAsync(`
+      CREATE TABLE people (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        archived INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE splits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+        person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
+        direction TEXT NOT NULL CHECK (direction IN ('owed_to_me','i_owe')),
+        settled_at INTEGER,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX idx_splits_txn ON splits (transaction_id);
+      CREATE INDEX idx_splits_person ON splits (person_id, settled_at);
+    `);
+
+    // A repayment arriving is not income, and lending money out is not a
+    // purchase. Reuse the money-moved machinery rather than inventing a second
+    // way for a category to be excluded from the totals.
+    await db.runAsync(
+      `INSERT OR IGNORE INTO categories
+         (name, kind, money_moved, sort_order, builtin, created_at)
+       VALUES ('Lending & Repayments', 'both', 1,
+               (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories), 1, ?)`,
+      [Date.now()]
+    );
   }
 
   await db.execAsync(`PRAGMA user_version = ${DATABASE_VERSION}`);

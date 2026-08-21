@@ -38,6 +38,8 @@ async function main(): Promise<void> {
   const source = fakeDb(4, {
     accounts: [{ id: 1, name: 'Cash' }],
   categories: [{ id: 1, name: 'Chai & snacks', kind: 'expense', builtin: 0 }],
+  people: [{ id: 1, name: 'Rahul' }],
+  splits: [{ id: 1, transaction_id: 7, person_id: 1, amount_paise: 30000, direction: 'owed_to_me' }],
     transactions: [{ id: 7, amount_paise: 12300, reference: '523401' }],
     category_rules: [{ pattern: 'swiggy', category: 'Food & Dining' }],
   });
@@ -77,8 +79,19 @@ async function main(): Promise<void> {
   await applyBackup(target.db, built);
   const deletes = target.log.filter((entry) => entry.sql.startsWith('DELETE'));
   const inserts = target.log.filter((entry) => entry.sql.startsWith('INSERT'));
-  check('every table is cleared', deletes.length === 4, String(deletes.length));
-  check('every row is reinserted', inserts.length === 4, String(inserts.length));
+  check('every table is cleared', deletes.length === 6, String(deletes.length));
+  check('every row is reinserted', inserts.length === 6, String(inserts.length));
+  // Splits point at both a transaction and a person, so all three have to come
+  // back or a restored ledger would owe money to nobody.
+  check(
+    'people are restored alongside the splits that name them',
+    inserts.some((entry) => entry.params.includes('Rahul'))
+  );
+  check(
+    'splits are cleared before the transactions they point at',
+    target.log.findIndex((e) => e.sql.includes('DELETE FROM splits')) <
+      target.log.findIndex((e) => e.sql.includes('DELETE FROM transactions'))
+  );
   check(
     'a custom category is restored so the rows using it still resolve',
     inserts.some((entry) => entry.params.includes('Chai & snacks'))
@@ -99,7 +112,7 @@ async function main(): Promise<void> {
   await applyBackup(forward.db, { ...built, schemaVersion: 2 } as BackupPayload);
   check(
     'older-schema backup still restores',
-    forward.log.filter((entry) => entry.sql.startsWith('INSERT')).length === 4
+    forward.log.filter((entry) => entry.sql.startsWith('INSERT')).length === 6
   );
 
   console.log(failures === 0 ? '\nAll assertions passed\n' : `\n${failures} assertion(s) failed\n`);

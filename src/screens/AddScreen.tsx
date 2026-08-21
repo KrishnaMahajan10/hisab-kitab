@@ -4,8 +4,17 @@ import { useSQLiteContext } from 'expo-sqlite';
 
 import { Button, Card, ChipGrid, ChipRow, SectionTitle } from '../components/ui';
 import { useCategories } from '../categories';
-import { insertTransaction, listAccounts, type Account } from '../db/repo';
-import { spacing, useTheme } from '../theme';
+import {
+  insertTransaction,
+  listAccounts,
+  listPeople,
+  replaceSplits,
+  type Account,
+  type Person,
+} from '../db/repo';
+import { SplitPicker } from '../components/SplitPicker';
+import { sharesTotal, type Shares } from '../splits';
+import { formatMoney, spacing, useTheme } from '../theme';
 
 const QUICK_AMOUNTS = [20, 50, 100, 200, 500];
 
@@ -22,18 +31,22 @@ export default function AddScreen({ onChanged }: { onChanged: () => void }) {
   const [category, setCategory] = useState<string>('Food & Dining');
   const [accountId, setAccountId] = useState<number | null>(null);
   const [entryKind, setEntryKind] = useState<EntryKind>('Expense');
+  const [people, setPeople] = useState<Person[]>([]);
+  const [shares, setShares] = useState<Shares>({});
 
   const direction: 'debit' | 'credit' = entryKind === 'Income' ? 'credit' : 'debit';
   const categoryOptions = categories.forDirection(direction);
 
   const changeEntryKind = (next: EntryKind) => {
     setEntryKind(next);
+    if (next === 'Income') setShares({});
     setCategory(next === 'Income' ? 'Salary' : 'Food & Dining');
   };
 
   const load = useCallback(async () => {
-    const rows = await listAccounts(db);
+    const [rows, peopleRows] = await Promise.all([listAccounts(db), listPeople(db)]);
     setAccounts(rows);
+    setPeople(peopleRows.filter((person) => !person.archived));
     setAccountId((current) => {
       if (current !== null && rows.some((row) => row.id === current)) return current;
       return rows.find((row) => row.kind === 'cash')?.id ?? rows[0]?.id ?? null;
@@ -57,7 +70,7 @@ export default function AddScreen({ onChanged }: { onChanged: () => void }) {
     }
 
     const now = Date.now();
-    await insertTransaction(db, {
+    const insertedId = await insertTransaction(db, {
       accountId,
       amountPaise: parsedPaise,
       direction,
@@ -73,10 +86,29 @@ export default function AddScreen({ onChanged }: { onChanged: () => void }) {
       dedupKey: `manual|${now}|${parsedPaise}|${Math.random().toString(36).slice(2, 10)}`,
     });
 
+    const owed = sharesTotal(shares);
+    if (insertedId !== null && owed > 0) {
+      await replaceSplits(
+        db,
+        insertedId,
+        Object.entries(shares).map(([personId, amountPaise]) => ({
+          personId: Number(personId),
+          amountPaise,
+          direction: 'owed_to_me' as const,
+        }))
+      );
+    }
+
     setAmount('');
     setTitle('');
+    setShares({});
     onChanged();
-    Alert.alert('Saved', 'Transaction added.');
+    Alert.alert(
+      'Saved',
+      owed > 0
+        ? `Transaction added. ${formatMoney(owed)} is owed to you.`
+        : 'Transaction added.'
+    );
   };
 
   return (
@@ -134,6 +166,17 @@ export default function AddScreen({ onChanged }: { onChanged: () => void }) {
           ]}
         />
       </Card>
+
+      {entryKind === 'Expense' ? (
+        <Card>
+          <SplitPicker
+            people={people}
+            shares={shares}
+            amountPaise={parsedPaise ?? 0}
+            onChange={setShares}
+          />
+        </Card>
+      ) : null}
 
       <Button
         label={entryKind === 'Income' ? 'Save income' : 'Save expense'}

@@ -3,6 +3,7 @@ import { Platform, StyleSheet, Text, View } from 'react-native';
 import DateTimePicker from '@react-native-community/datetimepicker';
 
 import { PERIODS, periodRange, recentMonths, type Period, type Range } from '../period';
+import { usePreferences } from '../preferences';
 import { formatDate, spacing, useTheme } from '../theme';
 import { Button, ChipRow } from './ui';
 
@@ -21,14 +22,15 @@ export type PeriodState = {
 };
 
 export function usePeriod(initial: Period = 'Month'): PeriodState {
+  const { cycleStartDay } = usePreferences();
   const [period, setPeriod] = useState<Period>(initial);
   const [customFrom, setCustomFrom] = useState<number | null>(null);
   const [customTo, setCustomTo] = useState<number | null>(null);
   const [monthAnchor, setMonthAnchor] = useState<number | null>(null);
 
   const range = useMemo(
-    () => periodRange(period, new Date(), customFrom, customTo, monthAnchor),
-    [period, customFrom, customTo, monthAnchor]
+    () => periodRange(period, new Date(), customFrom, customTo, monthAnchor, cycleStartDay),
+    [period, customFrom, customTo, monthAnchor, cycleStartDay]
   );
 
   return {

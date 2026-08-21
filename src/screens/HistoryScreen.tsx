@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  BackHandler,
   KeyboardAvoidingView,
   Modal,
   Platform,
@@ -22,14 +23,24 @@ import {
   Button,
   Card,
   ChipGrid,
+  ChipGridMulti,
   ChipRow,
   EmptyState,
   RemovableChip,
   SectionTitle,
 } from '../components/ui';
 import { useCategories } from '../categories';
+import { usePreferences } from '../preferences';
+import { SplitPicker } from '../components/SplitPicker';
+import { type Shares } from '../splits';
 import {
   deleteTransaction,
+  deleteTransactions,
+  listHistoryIds,
+  listPeople,
+  listSplitsForTransaction,
+  replaceSplits,
+  type Person,
   historySummary,
   learnRule,
   listAccounts,
@@ -92,10 +103,11 @@ export default function HistoryScreen({
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const categories = useCategories();
+  const { cycleStartDay } = usePreferences();
 
   const [rows, setRows] = useState<TransactionWithAccount[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [summary, setSummary] = useState({ count: 0, spent: 0, earned: 0, moved: 0 });
+  const [summary, setSummary] = useState({ count: 0, spent: 0, earned: 0, moved: 0, lent: 0 });
   const [search, setSearch] = useState('');
   const [filters, setFilters] = useState<HistoryFilters>(DEFAULT_FILTERS);
   const [sheetOpen, setSheetOpen] = useState(false);
@@ -105,9 +117,15 @@ export default function HistoryScreen({
   const [showPicker, setShowPicker] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
+  // A non-empty set is what puts the screen in selection mode, so there is no
+  // separate flag that could disagree with it.
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [people, setPeople] = useState<Person[]>([]);
+  // personId -> paise they owe on the row being edited. Empty means no split.
+  const [shares, setShares] = useState<Shares>({});
 
-  const range = useMemo(() => rangeOf(filters), [filters]);
-  const chips = useMemo(() => activeChips(filters), [filters]);
+  const range = useMemo(() => rangeOf(filters, new Date(), cycleStartDay), [filters, cycleStartDay]);
+  const chips = useMemo(() => activeChips(filters, cycleStartDay), [filters, cycleStartDay]);
   const filterCount = activeFilterCount(filters);
 
   const query = useMemo(
@@ -140,6 +158,22 @@ export default function HistoryScreen({
     void load(0, false);
   }, [load, refreshToken]);
 
+  // Narrowing the filter after selecting must not leave rows selected that are
+  // no longer on screen, or Delete would remove more than the user can see.
+  useEffect(() => {
+    setSelected(new Set());
+  }, [query]);
+
+  // Back should leave selection mode rather than the screen.
+  useEffect(() => {
+    if (selected.size === 0) return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      setSelected(new Set());
+      return true;
+    });
+    return () => subscription.remove();
+  }, [selected.size]);
+
   const refresh = useCallback(async () => {
     setRefreshing(true);
     await load(0, false);
@@ -149,12 +183,26 @@ export default function HistoryScreen({
   const openEditor = (row: TransactionWithAccount) => {
     setEditing(row);
     setDraft(toDraft(row));
+    setShares({});
+    void (async () => {
+      const [peopleRows, splitRows] = await Promise.all([
+        listPeople(db),
+        listSplitsForTransaction(db, row.id),
+      ]);
+      setPeople(peopleRows.filter((person) => !person.archived));
+      const loaded: Shares = {};
+      for (const split of splitRows) {
+        if (split.direction === 'owed_to_me') loaded[split.personId] = split.amountPaise;
+      }
+      setShares(loaded);
+    })();
   };
 
   const closeEditor = () => {
     setEditing(null);
     setDraft(null);
     setShowPicker(false);
+    setShares({});
   };
 
   const patch = (next: Partial<Draft>) =>
@@ -181,6 +229,16 @@ export default function HistoryScreen({
       note: draft.note.trim() || null,
     });
 
+    await replaceSplits(
+      db,
+      editing.id,
+      Object.entries(shares).map(([personId, amountPaise]) => ({
+        personId: Number(personId),
+        amountPaise,
+        direction: 'owed_to_me' as const,
+      }))
+    );
+
     if (draft.category !== editing.category) {
       const key = ruleKeyFor(merchant);
       if (key) await learnRule(db, key, draft.category);
@@ -190,6 +248,51 @@ export default function HistoryScreen({
     closeEditor();
     await load(0, false);
     onChanged();
+  };
+
+  const selecting = selected.size > 0;
+
+  const toggleSelected = (id: number) =>
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  const clearSelection = () => setSelected(new Set());
+
+  /**
+   * Selects everything the filter matches, not just the rows loaded so far —
+   * otherwise "select all" would quietly mean "select the first page".
+   */
+  const selectAllMatching = async () => {
+    setSelected(new Set(await listHistoryIds(db, query)));
+  };
+
+  const deleteSelected = () => {
+    const ids = [...selected];
+    Alert.alert(
+      `Delete ${ids.length} ${ids.length === 1 ? 'transaction' : 'transactions'}?`,
+      'This cannot be undone. Deleted transactions will not come back on the next scan, because the messages they came from have already been read.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: `Delete ${ids.length}`,
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              setSaving(true);
+              await deleteTransactions(db, ids);
+              setSaving(false);
+              clearSelection();
+              await load(0, false);
+              onChanged();
+            })();
+          },
+        },
+      ]
+    );
   };
 
   const remove = () => {
@@ -308,6 +411,26 @@ export default function HistoryScreen({
           </View>
         </View>
 
+        {selecting ? (
+          <View
+            style={[
+              styles.selectionBar,
+              { backgroundColor: theme.surface, borderColor: theme.accent },
+            ]}>
+            <Text style={[styles.selectionCount, { color: theme.text }]}>
+              {selected.size} selected
+            </Text>
+            <Button label="All" onPress={() => void selectAllMatching()} disabled={saving} />
+            <Button label="None" onPress={clearSelection} disabled={saving} />
+            <Button
+              label="Delete"
+              tone="danger"
+              onPress={deleteSelected}
+              disabled={saving}
+            />
+          </View>
+        ) : null}
+
         {rows.length === 0 ? (
           <EmptyState
             title={`Nothing in ${range.label}`}
@@ -324,12 +447,20 @@ export default function HistoryScreen({
               <Card>
                 {bucket.items.map((row, index) => {
                   const isDebit = row.direction === 'debit';
+                  const isSelected = selected.has(row.id);
                   return (
                     <Pressable
                       key={row.id}
-                      accessibilityRole="button"
-                      accessibilityHint="Opens the editor for this transaction"
-                      onPress={() => openEditor(row)}
+                      accessibilityRole={selecting ? 'checkbox' : 'button'}
+                      accessibilityState={selecting ? { checked: isSelected } : undefined}
+                      accessibilityHint={
+                        selecting
+                          ? 'Adds or removes this transaction from the selection'
+                          : 'Opens the editor. Long press to select several.'
+                      }
+                      onPress={() => (selecting ? toggleSelected(row.id) : openEditor(row))}
+                      onLongPress={() => toggleSelected(row.id)}
+                      delayLongPress={250}
                       style={({ pressed }) => [
                         styles.row,
                         index > 0
@@ -338,8 +469,16 @@ export default function HistoryScreen({
                               borderTopWidth: StyleSheet.hairlineWidth,
                             }
                           : null,
+                        isSelected ? { backgroundColor: theme.surfaceAlt } : null,
                         pressed ? { opacity: 0.6 } : null,
                       ]}>
+                      {selecting ? (
+                        <Ionicons
+                          name={isSelected ? 'checkbox' : 'square-outline'}
+                          size={20}
+                          color={isSelected ? theme.accent : theme.textMuted}
+                        />
+                      ) : null}
                       <View style={styles.grow}>
                         <View style={styles.titleLine}>
                           <Text style={[styles.rowTitle, { color: theme.text }]} numberOfLines={1}>
@@ -364,7 +503,9 @@ export default function HistoryScreen({
                         {isDebit ? '−' : '+'}
                         {formatMoney(row.amount_paise)}
                       </Text>
-                      <Ionicons name="chevron-forward" size={16} color={theme.textMuted} />
+                      {selecting ? null : (
+                        <Ionicons name="chevron-forward" size={16} color={theme.textMuted} />
+                      )}
                     </Pressable>
                   );
                 })}
@@ -560,6 +701,19 @@ export default function HistoryScreen({
                       ]}
                     />
 
+                    {draft.direction === 'debit' ? (
+                      <SplitPicker
+                        people={people}
+                        shares={shares}
+                        amountPaise={
+                          Math.round(
+                            (Number.parseFloat(draft.amount.replace(/,/g, '')) || 0) * 100
+                          )
+                        }
+                        onChange={setShares}
+                      />
+                    ) : null}
+
                     {reference ? (
                       <Text style={[styles.meta, { color: theme.textMuted }]} selectable>
                         Bank reference (UTR): {reference}
@@ -626,6 +780,17 @@ const styles = StyleSheet.create({
     minHeight: 36,
   },
   filterButtonLabel: { fontSize: 13, fontWeight: '700' },
+  selectionBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  selectionCount: { fontSize: 13, fontWeight: '700', flex: 1 },
   summaryCard: {
     marginTop: spacing.md,
     marginBottom: spacing.xs,

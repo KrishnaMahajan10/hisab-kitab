@@ -49,12 +49,64 @@ function shortDate(ms: number): string {
  * Ranges are half-open [from, to) so a transaction at exactly midnight belongs
  * to one period only and never both.
  */
+export const DEFAULT_CYCLE_START_DAY = 1;
+
+/**
+ * A cycle day past the end of a short month falls on its last day: a cycle set
+ * to the 31st runs to 28 February rather than skipping the month.
+ */
+function clampDay(year: number, month: number, day: number): number {
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  return Math.min(Math.max(Math.trunc(day), 1), daysInMonth);
+}
+
+function cycleStartOn(year: number, month: number, startDay: number): Date {
+  // Normalise first, so month -1 or 12 resolves to the right year.
+  const normalized = new Date(year, month, 1);
+  return new Date(
+    normalized.getFullYear(),
+    normalized.getMonth(),
+    clampDay(normalized.getFullYear(), normalized.getMonth(), startDay)
+  );
+}
+
+/**
+ * The cycle containing `now`. With a start day of 7, the 3rd of March belongs to
+ * the cycle that began on 7 February — a salary paid on the 7th should be spent
+ * against the month it arrived in, not split across two calendar months.
+ */
+function cycleAround(now: Date, startDay: number): { from: Date; to: Date } {
+  const thisMonth = cycleStartOn(now.getFullYear(), now.getMonth(), startDay);
+  const from =
+    startOfDay(now).getTime() >= thisMonth.getTime()
+      ? thisMonth
+      : cycleStartOn(now.getFullYear(), now.getMonth() - 1, startDay);
+  return { from, to: cycleStartOn(from.getFullYear(), from.getMonth() + 1, startDay) };
+}
+
+/** The cycle that starts in the month the anchor falls in. */
+function cycleForMonth(anchor: Date, startDay: number): { from: Date; to: Date } {
+  const from = cycleStartOn(anchor.getFullYear(), anchor.getMonth(), startDay);
+  return { from, to: cycleStartOn(from.getFullYear(), from.getMonth() + 1, startDay) };
+}
+
+/**
+ * A cycle that starts on the 1st is just a calendar month, so it keeps the plain
+ * month name. Any other start day has to show its real span, or "September"
+ * would be a lie about which days are counted.
+ */
+function cycleLabel(from: Date, to: Date, startDay: number): string {
+  if (startDay === 1) return monthLabel(from);
+  return `${shortDate(from.getTime())} – ${shortDate(to.getTime() - DAY_MS)}`;
+}
+
 export function periodRange(
   period: Period,
   now: Date,
   customFrom: number | null,
   customTo: number | null,
-  monthAnchor: number | null = null
+  monthAnchor: number | null = null,
+  cycleStartDay: number = DEFAULT_CYCLE_START_DAY
 ): Range {
   const today = startOfDay(now);
 
@@ -75,17 +127,25 @@ export function periodRange(
       return { from, to, label: `${shortDate(from)} – ${shortDate(to - DAY_MS)}` };
     }
     case 'Month': {
-      const from = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-      const to = new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime();
-      return { from, to, label: monthLabel(now) };
+      const cycle = cycleAround(now, cycleStartDay);
+      return {
+        from: cycle.from.getTime(),
+        to: cycle.to.getTime(),
+        label: cycleLabel(cycle.from, cycle.to, cycleStartDay),
+      };
     }
     case 'Pick month': {
       // No month chosen yet reads as the current one, so the range is never
       // empty while the picker is still untouched.
-      const anchor = monthAnchor === null ? now : new Date(monthAnchor);
-      const from = new Date(anchor.getFullYear(), anchor.getMonth(), 1).getTime();
-      const to = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 1).getTime();
-      return { from, to, label: monthLabel(anchor) };
+      const cycle =
+        monthAnchor === null
+          ? cycleAround(now, cycleStartDay)
+          : cycleForMonth(new Date(monthAnchor), cycleStartDay);
+      return {
+        from: cycle.from.getTime(),
+        to: cycle.to.getTime(),
+        label: cycleLabel(cycle.from, cycle.to, cycleStartDay),
+      };
     }
     case 'Year': {
       const from = new Date(now.getFullYear(), 0, 1).getTime();

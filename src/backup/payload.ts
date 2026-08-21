@@ -4,8 +4,10 @@ export const BACKUP_FORMAT = 'hisab-backup';
 export const BACKUP_TABLES = [
   'accounts',
   'categories',
+  'people',
   'transactions',
   'category_rules',
+  'splits',
 ] as const;
 
 export type BackupPayload = {
@@ -15,8 +17,10 @@ export type BackupPayload = {
   exportedAt: string;
   accounts: unknown[];
   categories: unknown[];
+  people: unknown[];
   transactions: unknown[];
   category_rules: unknown[];
+  splits: unknown[];
 };
 
 async function schemaVersion(db: SQLiteDatabase): Promise<number> {
@@ -58,7 +62,9 @@ export async function applyBackup(db: SQLiteDatabase, payload: BackupPayload): P
   }
 
   await db.withTransactionAsync(async () => {
+    await db.execAsync('DELETE FROM splits');
     await db.execAsync('DELETE FROM transactions');
+    await db.execAsync('DELETE FROM people');
     await db.execAsync('DELETE FROM category_rules');
     await db.execAsync('DELETE FROM categories');
     await db.execAsync('DELETE FROM accounts');

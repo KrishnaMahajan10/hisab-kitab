@@ -43,6 +43,7 @@ export default function HomeScreen({
   const earned = summary?.earned ?? 0;
   const net = earned - spent;
   const moved = summary?.moved ?? 0;
+  const lent = summary?.lent ?? 0;
   const count = summary?.count ?? 0;
   const maxCategory = summary?.byCategory[0]?.total ?? 1;
   const isEmpty = count === 0;
@@ -77,6 +78,11 @@ export default function HomeScreen({
             <Text style={[styles.medium, { color: theme.text }]}>{count}</Text>
           </View>
         </View>
+        {lent > 0 ? (
+          <Text style={[styles.movedNote, { color: theme.textMuted }]}>
+            {formatMoney(lent)} paid for other people — counted against them, not you
+          </Text>
+        ) : null}
         {moved > 0 ? (
           <Text style={[styles.movedNote, { color: theme.textMuted }]}>
             {formatMoney(moved)} moved between your own accounts or to cash — not counted as

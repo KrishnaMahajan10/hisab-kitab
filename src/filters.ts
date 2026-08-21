@@ -32,13 +32,18 @@ export const DEFAULT_FILTERS: HistoryFilters = {
   categories: [],
 };
 
-export function rangeOf(filters: HistoryFilters, now = new Date()): Range {
+export function rangeOf(
+  filters: HistoryFilters,
+  now = new Date(),
+  cycleStartDay?: number
+): Range {
   return periodRange(
     filters.period,
     now,
     filters.customFrom,
     filters.customTo,
-    filters.monthAnchor
+    filters.monthAnchor,
+    cycleStartDay
   );
 }
 
@@ -56,12 +61,15 @@ export function activeFilterCount(filters: HistoryFilters): number {
 
 export type ActiveChip = { key: string; label: string; clear: (f: HistoryFilters) => HistoryFilters };
 
-export function activeChips(filters: HistoryFilters): ActiveChip[] {
+export function activeChips(
+  filters: HistoryFilters,
+  cycleStartDay?: number
+): ActiveChip[] {
   const chips: ActiveChip[] = [];
 
   chips.push({
     key: 'period',
-    label: rangeOf(filters).label,
+    label: rangeOf(filters, new Date(), cycleStartDay).label,
     clear: (f) => ({
       ...f,
       period: DEFAULT_FILTERS.period,

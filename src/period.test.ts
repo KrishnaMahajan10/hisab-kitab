@@ -114,5 +114,77 @@ check('short labels are unique', new Set(months.map((m) => m.short)).size === 12
 check('every anchor round-trips to its own month', months.every((m) => periodRange('Pick month', NOW, null, null, m.anchor).label === m.label));
 console.log('  ' + months.map((m) => m.short).join('  '));
 
+console.log('\nCustom monthly cycle — salary on the 7th\n');
+
+const cyc = (nowDate: Date, day: number, anchor: number | null = null) =>
+  periodRange(anchor === null ? 'Month' : 'Pick month', nowDate, null, null, anchor, day);
+
+const ymd = (ms: number) => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+// 20 Aug is after the 7th, so it belongs to the cycle that began 7 Aug.
+const after = cyc(new Date(2026, 7, 20), 7);
+check('a date after the cycle day starts this month', ymd(after.from!) === '2026-08-07', ymd(after.from!));
+check('and ends on the next cycle day', ymd(after.to!) === '2026-09-07', ymd(after.to!));
+console.log(`  20 Aug, cycle 7  ->  ${ymd(after.from!)} to ${ymd(after.to!)}   "${after.label}"`);
+
+// 3 Aug is before the 7th, so it still belongs to the cycle that began 7 Jul.
+const before = cyc(new Date(2026, 7, 3), 7);
+check('a date before the cycle day starts last month', ymd(before.from!) === '2026-07-07', ymd(before.from!));
+check('and ends on this month cycle day', ymd(before.to!) === '2026-08-07', ymd(before.to!));
+console.log(`  3 Aug, cycle 7   ->  ${ymd(before.from!)} to ${ymd(before.to!)}   "${before.label}"`);
+
+// The cycle day itself opens a new cycle rather than closing the old one.
+const onDay = cyc(new Date(2026, 7, 7), 7);
+check('the cycle day starts the new cycle', ymd(onDay.from!) === '2026-08-07', ymd(onDay.from!));
+
+// Every day belongs to exactly one cycle, with no gap and no overlap.
+check('one cycle ends exactly where the next begins', before.to === after.from);
+check('a salary paid on the 7th lands in the cycle it opens',
+  new Date(2026, 7, 7, 9, 30).getTime() >= after.from! && new Date(2026, 7, 7, 9, 30).getTime() < after.to!);
+check('the 6th belongs to the previous cycle',
+  new Date(2026, 7, 6, 23, 59).getTime() < after.from!);
+
+console.log('\nCycle days that do not exist in every month\n');
+
+// A cycle set to the 31st has to land somewhere in February.
+const feb = cyc(new Date(2026, 1, 15), 31);
+check('a 31st cycle clamps to the last day of February', ymd(feb.from!) === '2026-01-31', ymd(feb.from!));
+check('and to the last day of the next short month', ymd(feb.to!) === '2026-02-28', ymd(feb.to!));
+console.log(`  15 Feb, cycle 31 ->  ${ymd(feb.from!)} to ${ymd(feb.to!)}`);
+
+const leapFeb = cyc(new Date(2024, 2, 15), 30);
+check('a leap February clamps to the 29th', ymd(leapFeb.from!) === '2024-02-29', ymd(leapFeb.from!));
+
+// December to January must cross the year correctly.
+const decemberCycle = cyc(new Date(2025, 11, 20), 7);
+check('a December cycle ends in the next year', ymd(decemberCycle.to!) === '2026-01-07', ymd(decemberCycle.to!));
+
+console.log('\nA cycle of 1 is still a calendar month\n');
+
+const calendar = cyc(new Date(2026, 7, 20), 1);
+const plainMonth = periodRange('Month', new Date(2026, 7, 20), null, null);
+check('day 1 matches the calendar month', calendar.from === plainMonth.from && calendar.to === plainMonth.to);
+check('day 1 keeps the plain month label', calendar.label === plainMonth.label, calendar.label);
+check('a cycle label shows its real span', after.label.includes('Aug') && after.label.includes('Sept'), after.label);
+
+console.log('\nPicking a month follows the cycle too\n');
+
+const septemberCycle = cyc(new Date(2026, 7, 20), 7, new Date(2026, 8, 1).getTime());
+check('picking September starts on 7 Sep', ymd(septemberCycle.from!) === '2026-09-07', ymd(septemberCycle.from!));
+check('and ends on 7 Oct', ymd(septemberCycle.to!) === '2026-10-07', ymd(septemberCycle.to!));
+// The anchor names a month, so a mid-month anchor picks the same cycle.
+const midAnchor = cyc(new Date(2026, 7, 20), 7, new Date(2026, 8, 22).getTime());
+check('a mid-month anchor picks the same cycle', midAnchor.from === septemberCycle.from);
+
+// Day, week and year are calendar facts and must ignore the cycle entirely.
+for (const period of ['Day', 'Week', 'Year', 'All'] as const) {
+  const plain = periodRange(period, NOW, null, null);
+  const withCycle = periodRange(period, NOW, null, null, null, 7);
+  check(`${period} ignores the cycle`, plain.from === withCycle.from && plain.to === withCycle.to);
+}
+
 console.log(failures === 0 ? '\nAll assertions passed\n' : `\n${failures} assertion(s) failed\n`);
 process.exit(failures === 0 ? 0 : 1);

@@ -5,6 +5,7 @@ import { File } from 'expo-file-system';
 import HisabCapture, { type PdfExtractErrorCode } from '../../modules/hisab-capture';
 import {
   createAccount,
+  deleteTransaction,
   findAccountByLast4,
   findAccountByName,
   findNearDuplicate,
@@ -12,7 +13,11 @@ import {
   listRules,
 } from '../db/repo';
 import { suggestCategory } from '../parse/categorize';
-import { CROSS_SOURCE_WINDOW_MS, NEAR_DUPLICATE_WINDOW_MS } from '../parse/parse';
+import {
+  CROSS_SOURCE_WINDOW_MS,
+  NEAR_DUPLICATE_WINDOW_MS,
+  statementSupersedes,
+} from '../parse/parse';
 import type { Cell } from './biff';
 import { looksLikeXls, readXlsSheets } from './biff';
 import { looksLikeDelimitedText, readCsvGrid } from './csv';
@@ -36,7 +41,14 @@ export const STATEMENT_MIME_TYPES = [
 ];
 
 export type ImportOutcome =
-  | { status: 'ok'; imported: number; duplicates: number; unparsed: number; format: string }
+  | {
+      status: 'ok';
+      imported: number;
+      duplicates: number;
+      replaced: number;
+      unparsed: number;
+      format: string;
+    }
   | { status: 'needs-password' }
   | { status: 'unsupported'; preview: string }
   | { status: 'error'; code: PdfExtractErrorCode | 'unknown'; message: string };
@@ -74,10 +86,11 @@ async function insertRows(
   db: SQLiteDatabase,
   rows: StatementRow[],
   format: string
-): Promise<{ imported: number; duplicates: number }> {
+): Promise<{ imported: number; duplicates: number; replaced: number }> {
   const rules = await listRules(db);
   let imported = 0;
   let duplicates = 0;
+  let replaced = 0;
 
   for (const row of rows) {
     const merchantIdentity = row.merchant
@@ -97,9 +110,17 @@ async function insertRows(
         crossSourceWindowMs: CROSS_SOURCE_WINDOW_MS,
         reference: row.reference,
       });
+
       if (duplicate) {
-        duplicates += 1;
-        continue;
+        if (!statementSupersedes(duplicate, row)) {
+          duplicates += 1;
+          continue;
+        }
+        // The captured row is still waiting to be reviewed and the statement
+        // knows this payment better, so drop the request rather than leaving the
+        // weaker guess in the queue.
+        await deleteTransaction(db, duplicate.id);
+        replaced += 1;
       }
     }
 
@@ -111,7 +132,7 @@ async function insertRows(
       ? `stmt|${format}|${row.reference}`
       : `stmt|${format}|${row.occurredAt}|${row.amountPaise}|${merchantIdentity ?? 'x'}`;
 
-    const inserted = await insertTransaction(db, {
+    const insertedId = await insertTransaction(db, {
       accountId,
       amountPaise: row.amountPaise,
       direction: row.direction,
@@ -127,11 +148,11 @@ async function insertRows(
       reference: row.reference,
     });
 
-    if (inserted) imported += 1;
+    if (insertedId !== null) imported += 1;
     else duplicates += 1;
   }
 
-  return { imported, duplicates };
+  return { imported, duplicates, replaced };
 }
 
 const ZIP_SIGNATURE = [0x50, 0x4b, 0x03, 0x04];
@@ -206,12 +227,13 @@ async function importTabularStatement(
     };
   }
 
-  const { imported, duplicates } = await insertRows(db, parsed.rows, 'table');
+  const { imported, duplicates, replaced } = await insertRows(db, parsed.rows, 'table');
 
   return {
     status: 'ok',
     imported,
     duplicates,
+    replaced,
     unparsed: parsed.skipped,
     format: 'table',
   };
@@ -281,12 +303,13 @@ export async function importStatementPdf(
     };
   }
 
-  const { imported, duplicates } = await insertRows(db, parsed.rows, parsed.format);
+  const { imported, duplicates, replaced } = await insertRows(db, parsed.rows, parsed.format);
 
   return {
     status: 'ok',
     imported,
     duplicates,
+    replaced,
     unparsed: parsed.skipped,
     format: parsed.format,
   };

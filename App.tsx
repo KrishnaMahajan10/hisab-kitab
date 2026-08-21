@@ -19,6 +19,7 @@ import AddScreen from './src/screens/AddScreen';
 import HistoryScreen from './src/screens/HistoryScreen';
 import SetupScreen from './src/screens/SetupScreen';
 import { CategoriesProvider } from './src/categories';
+import { PreferencesProvider } from './src/preferences';
 import { drainCaptures } from './src/sync';
 import { spacing, useTheme } from './src/theme';
 
@@ -147,9 +148,11 @@ export default function App() {
     <SafeAreaProvider>
       <StatusBar style="auto" />
       <SQLiteProvider databaseName={DATABASE_NAME} onInit={migrate}>
-        <CategoriesProvider>
-          <Shell />
-        </CategoriesProvider>
+        <PreferencesProvider>
+          <CategoriesProvider>
+            <Shell />
+          </CategoriesProvider>
+        </PreferencesProvider>
       </SQLiteProvider>
     </SafeAreaProvider>
   );
