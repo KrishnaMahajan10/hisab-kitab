@@ -1,15 +1,88 @@
 # Hisab Kitab
 
-Android expense tracker that reads your transactions instead of asking you to type them.
+**Android expense tracker that reads your transactions instead of asking you to type them.**
 
-Bank SMS and payment-app notifications are captured automatically, parsed into transactions,
-and queued for a one-tap confirm. Cash is the only thing you enter by hand.
+Bank SMS and payment-app notifications are captured automatically, parsed into transactions, and
+queued for a one-tap confirm. Bank statements in PDF, XLS and CSV back-fill the history. Everything
+is stored on the phone — no account, no server, no data leaving the device.
+
+Built for Indian banking: UPI, NEFT/IMPS/RTGS, card swipes, ATM withdrawals, and the SMS formats
+that HDFC, ICICI, SBI, Axis, Kotak and Bank of Baroda actually send.
+
+React Native · Expo SDK 57 · TypeScript (strict) · SQLite · a hand-written Kotlin native module
+
+---
 
 ## Why this exists
 
 Manual expense apps fail because you forget. Hisab Kitab inverts that: the phone already knows about
 every card swipe, UPI payment and bank transfer, because your bank sends an SMS and your payment
 app posts a notification. Hisab Kitab listens to both.
+
+## Engineering highlights
+
+The parts of this project that were actually hard, and what they demonstrate.
+
+**A spreadsheet reader written from scratch, in TypeScript.**
+Bank `.xls` exports are legacy BIFF8 workbooks inside an OLE2 compound file. Rather than ship a
+heavyweight dependency into a React Native bundle, the format is parsed directly:
+[`ole2.ts`](src/import/ole2.ts) walks the FAT, DIFAT and mini-FAT sector chains to find the workbook
+stream; [`biff.ts`](src/import/biff.ts) decodes the record stream, including the shared-string table
+that spills across `CONTINUE` records — where a single string can be cut in half and the
+continuation restates its own character width. Verified against a real ICICI export: 15/15
+transactions, correct to the paisa against the statement's own running balance.
+
+**Three-layer deduplication across independent data sources.**
+One payment can arrive as a bank SMS, a payment-app notification, and later a statement row, each
+with a different timestamp and a different spelling of the payee. Getting this wrong in either
+direction is bad: a missed duplicate inflates your spending, an over-eager match silently deletes a
+real transaction. The solution layers an exact hash, then UTR matching by containment (banks quote a
+6-digit fragment of a 12-digit reference), then a time-and-merchant heuristic whose window widens
+*only across sources* — so a statement row and an SMS nine hours apart collapse into one, while two
+₹20 chai payments to the same shop on the same day stay two payments. See
+[Deduplication](#deduplication).
+
+**A rules engine users can actually drive.**
+Categorisation started as a keyword list, became a set of rules learned silently from corrections,
+and is now a small predicate language: field × match type × direction × amount band × priority, with
+a dry-run that counts how many existing transactions a new rule would move before you commit to it.
+[`categorize.ts`](src/parse/categorize.ts) keeps the matching pure so all of it is testable without
+a database.
+
+**Correctness where money is involved.**
+Amounts are integer paise, never floats. Date ranges are half-open `[from, to)` so a midnight
+transaction belongs to exactly one period. Transfers between your own accounts are detected from the
+account numbers in the message — not from the words "IMPS" or "transfer", which say nothing about
+who the other side belongs to — and excluded from spending totals, because moving your own money
+between pockets is not an expense.
+
+**Schema that evolved without losing data.**
+Seven migrations, each written to preserve what was already captured: back-filling payment
+references by re-parsing stored message bodies, rebuilding the rules table to drop a constraint that
+had become wrong, and moving categories from hardcoded arrays into a table while keeping every
+existing transaction pointing at the right one.
+
+## Tech stack
+
+| Area | Choice | Why |
+| --- | --- | --- |
+| App | React Native 0.86, Expo SDK 57, TypeScript `strict` | Single codebase, typed end to end |
+| Native | Kotlin Expo module | SMS and notification capture have no JS equivalent |
+| Storage | `expo-sqlite`, 7 versioned migrations | Relational queries for the summaries; works offline |
+| PDF | PDFBox-Android via the native module | Handles password-protected statements |
+| XLS / CSV | Hand-written OLE2 + BIFF8 + RFC 4180 readers | No dependency, works in the RN runtime |
+| Auth | `expo-auth-session`, PKCE, `drive.appdata` scope only | Backup cannot read the rest of your Drive |
+| Tests | 11 suites of plain assertions run by `tsx` | No framework; each suite runs in under a second |
+
+## What it does
+
+- **Captures automatically** — bank SMS and payment-app notifications become pending transactions
+- **Imports statements** — PhonePe PDF, legacy `.xls`, CSV and TSV, mapped without knowing the bank
+- **Sorts spending** — ~300 Indian merchant keywords, plus rules you write yourself
+- **Categories you control** — add, rename and hide them; renaming updates every transaction
+- **Honest totals** — self-transfers, card payments and cash withdrawals are money moved, not spent
+- **Filters** — day, week, month, a specific month, year, or a custom range
+- **Backup** — one file in a private Google Drive folder, or a JSON export you keep yourself
 
 ## How capture works
 
@@ -20,31 +93,49 @@ app posts a notification. Hisab Kitab listens to both.
 | Cash | cash spends | manual quick-add |
 | Anything | expenses **and** income you enter yourself | Add tab |
 | Statement PDF | back-filling months of history | PDFBox text extraction + parser |
+| Statement XLS | bank exports | OLE2 + BIFF8 reader written for this project |
+| Statement CSV | bank exports | delimiter sniffing + RFC 4180 reader |
 
 ### Statement import
 
-**Setup → Import a statement** takes a PhonePe transaction statement PDF and queues every payment
-in it for review. Text is extracted natively with PDFBox-Android (which also handles
-password-protected PDFs — there is a password field above the button).
+**Setup → Import a statement** takes a statement file — PDF, `.xls`, CSV or TSV — and queues every
+payment in it for review. The format is decided by reading the file's first bytes rather than
+trusting its extension, because banks hand out `.xls` files that are really CSV.
 
-Verified against a real 46-transaction statement: 46/46 rows parsed, 0 skipped, every row with an
-exact timestamp, merchant, source-account mask, and a UTR / Transaction ID.
+Whichever path a file takes, imported rows go through the same dedup check as live captures, so a
+payment already caught from SMS is not counted again.
 
-The UTR is used as the dedup key, so re-importing the same statement imports nothing twice.
-Imported rows are also checked against transactions already captured from SMS and notifications, so
-a payment caught live is not counted again.
-
-Accounts are auto-created from the statement's `Paid by` mask — a 4-digit mask becomes
+**PDF** text is extracted natively with PDFBox-Android, which also handles password-protected files
+(there is a password field above the button). Verified against a real 46-transaction PhonePe
+statement: 46/46 rows parsed, 0 skipped, every row with an exact timestamp, merchant, source-account
+mask, and a UTR. Accounts are auto-created from the `Paid by` mask — a 4-digit mask becomes
 `Card ••9823`, a shorter one becomes `UPI ••10`.
 
-Two honest limits:
+**Spreadsheets and delimited files** go through [`table.ts`](src/import/table.ts), which does not
+need to know which bank produced the file. The header row is found by scoring column-name synonyms,
+and the rows are then read through whichever shape that reveals:
 
-- **Only PhonePe is supported so far.** Any other statement is rejected with a preview of what was
-  extracted, rather than silently mis-parsed. Bank statements differ per bank and need their own
-  parser; the importer is structured so adding one means a new module in `src/import/`.
-- **Person-to-person payments land in "Other."** On the real statement, 38 of 46 rows were people
-  and small local shops (`Dad`, `Mahesh super shopeee`) that no keyword list can classify.
-  Categorize a payee once in Review and the learned rule handles it forever after.
+| Shape | Seen in |
+| --- | --- |
+| Separate withdrawal and deposit columns | ICICI (verified against a real export), HDFC |
+| One amount column plus a `DR`/`CR` indicator | Axis |
+| One signed amount column | several card exports |
+
+Dates are read day-first (`15/08/2026`, `15-Aug-2026`, `15-Sept-2026`, ISO, and raw Excel serials).
+Payment references are pulled out of the narration *by shape* rather than by keyword, because banks
+slot the UTR into an unlabelled slash-delimited field — `UPI/SAFA ARBAZ/…/659315937795/ICI71…`.
+
+Three honest limits:
+
+- **`.xlsx` is not supported.** It is a ZIP archive and would need a DEFLATE decoder. The file is
+  detected and you are told to re-save as `.xls` or CSV, rather than getting a confusing failure.
+- **Only PhonePe PDFs are supported.** Other banks' PDFs lose their table geometry during text
+  extraction — Bank of Baroda emits every description, then every debit, then every balance as
+  separate blocks, so no line-based parser can pair an amount with its row. Their CSV or XLS export
+  works through the table path instead.
+- **Person-to-person payments land in "Other."** On a real statement, 38 of 46 rows were people and
+  small local shops (`Dad`, `Mahesh super shopeee`) that no keyword list can classify. Categorise a
+  payee once in Review and the learned rule handles it from then on.
 
 PDF text extractors disagree about line grouping, so the parser accepts three shapes: one line per
 row (`DEBIT ₹100\tPaid to X`), type/amount/detail split across lines, and the combined table row
@@ -132,26 +223,47 @@ The list pages 50 at a time with a "Load more" button rather than loading a whol
 
 ## Categories
 
-Expense and income have separate lists, so you only ever see relevant options. Defined in
-`src/db/schema.ts` — `category` is a plain `TEXT` column with no constraint, so adding one needs
-no migration.
+Categories live in a `categories` table, editable from **Setup → Categories**. You can add your own,
+rename any of them, hide the ones you never use, and mark a category as *money moved* so it stays
+out of your spending totals.
 
-**Expense (31)** — Food & Dining, Groceries, Transport, Fuel, Travel, Shopping, Clothing,
-Electronics, Bills & Utilities, Mobile & Internet, Rent, Household, Domestic Help, Health, Fitness,
-Personal Care, Education, Kids & Family, Pets, Entertainment, Subscriptions, Insurance, Loan & EMI,
-Credit Card Payment, Taxes & Fees, Bank Charges, Gifts & Donations, Cash Withdrawal, Investments,
-Transfers, Other
+Each category is offered for expenses, for income, or both — so a picker only ever shows relevant
+options. The 40 built-in ones are seeded on first run from `src/db/schema.ts` and are marked
+`builtin` so they can be told apart from yours.
 
-**Income (10)** — Salary, Freelance, Business, Interest & Dividends, Refunds & Cashback,
-Rent Received, Gifts Received, Investments, Transfers, Other Income
+Transactions store the category as plain `TEXT` rather than a foreign key. That keeps a backup file
+readable on its own and avoids a data migration every time the list changes; a rename updates the
+transactions and rules in one transaction so nothing is left orphaned.
 
-Auto-categorization matches ~300 Indian merchant keywords in `src/parse/categorize.ts` — Swiggy →
-Food & Dining, HPCL → Fuel, Netflix → Subscriptions, ATM → Cash Withdrawal, and so on. Income
-keywords only apply to credits and expense keywords only to debits, so a "refund" credit can never
-be filed as a purchase.
+### How a category gets picked
 
-To add a category, append it to `EXPENSE_CATEGORIES` or `INCOME_CATEGORIES` and optionally add
-keywords to `KEYWORD_MAP`. Nothing else needs touching.
+Three layers, in order:
+
+1. **Rules you wrote** — see below
+2. **Rules learned from your corrections** — changing a category in Review writes one automatically
+3. **~300 Indian merchant keywords** in `src/parse/categorize.ts` — Swiggy → Food & Dining, HPCL →
+   Fuel, Netflix → Subscriptions, ATM → Cash Withdrawal
+
+Income keywords only apply to credits and expense keywords only to debits, so a "refund" credit can
+never be filed as a purchase.
+
+### Rules
+
+**Setup → Rules** is a small predicate builder. A rule is a pattern plus any conditions you want:
+
+| Part | Options |
+| --- | --- |
+| Look at | anywhere · merchant · title · note |
+| Match | contains · starts with · ends with · is exactly · regex |
+| Applies to | both · expenses · income |
+| Amount between | optional floor and ceiling |
+| Priority | lower runs first |
+
+So `merchant contains "bharatpe" → Food & Dining`, or the case a keyword list can never handle:
+the same payee meaning *rent* over ₹1,000 and *a gift* under it.
+
+**Re-apply** sweeps transactions already stored, but counts first and asks — *"412 of 1,203
+transactions would change category"* — because re-categorising cannot be undone.
 
 Picker UX: **Add** shows every category in a wrapping grid. **Review** shows a horizontal row with
 the current pick first (one-tap correction), and the full grid under *Edit*.
@@ -267,26 +379,41 @@ npm test
 Axis, Kotak), payment-app notifications, and noise samples (OTPs, promos, balance-only alerts) that
 must be rejected.
 
-```bash
-npm run test:import
-```
+Eleven suites in total, each a plain assertion script run by `tsx` — no test framework, and every
+suite finishes in under a second.
 
-Runs the statement parser against all three PDF text-extraction shapes.
+| Script | Covers |
+| --- | --- |
+| `npm test` | SMS and notification parsing against real bank formats |
+| `npm run test:import` | PhonePe PDF parser, all three text-extraction shapes |
+| `npm run test:dedup` | Cross-source dedup, plus guards against over-collapsing |
+| `npm run test:table` | Bank-agnostic table mapper, and a real `.xls` end to end |
+| `npm run test:csv` | Delimiter sniffing, RFC 4180 quoting, human-written numbers |
+| `npm run test:rules` | Rule matching, conditions, and priority ordering |
+| `npm run test:period` | Period boundaries, leap months, year rollover |
+| `npm run test:filters` | Filter state, chips, and clearing |
+| `npm run test:labels` | Row titles and provenance tags |
+| `npm run test:totals` | Which categories count toward spending |
+| `npm run test:backup` | Backup payload, and refusing a newer-schema restore |
 
-```bash
-npm run test:dedup
-```
-
-Runs the cross-source deduplication logic — reference extraction from SMS, reference and merchant
-matching, and guards that two different payees or two unrelated references must **not** collapse.
+Every test asserts a behaviour rather than an implementation detail, and several exist specifically
+to pin down a bug that was found and fixed — a spread that would blow the stack on a large sheet, a
+date-only statement row slipping past dedup, a filter reset that silently missed a new field.
 
 ## Backup
 
-Local-only by design — bank SMS never leaves the device. **Setup → Export** writes a JSON file and
-opens the share sheet, so you can save it to Google Drive yourself. **Restore** reads it back and
-replaces all data.
+Local-first by design — bank SMS never leaves the device unless you ask it to.
 
-There is no cloud sync and no server. Nothing is uploaded anywhere.
+**Setup → Export** writes a JSON file and opens the share sheet, so you can put it wherever you
+like. **Restore** reads it back and replaces all data, refusing a backup written by a newer version
+of the app rather than applying half of it.
+
+**Google Drive backup** is optional. It signs in with PKCE and requests the `drive.appdata` scope
+and nothing else, so the app can only see its own hidden folder — never the rest of your Drive. The
+refresh token is kept in the device keystore via `expo-secure-store`. Backups are pruned to the last
+ten, so one bad snapshot cannot erase every good one.
+
+There is no server, no account, and no analytics.
 
 ## Distribution constraint
 
@@ -302,21 +429,33 @@ allow with a disclosure.
 
 ```
 App.tsx                          tabs, DB provider, live capture wiring
-src/db/schema.ts                 migrations, category list
-src/db/repo.ts                   queries, near-duplicate lookup, summaries
-src/parse/parse.ts               SMS/notification → transaction
-src/parse/parse.test.ts          parser tests against real formats
-src/parse/categorize.ts          merchant → category, learned rules
-src/sync.ts                      drain queue → parse → insert
-src/labels.ts                    provenance tags (SMS / NOTIF / PDF / MANUAL)
+src/categories.tsx               the live category list, read by every picker
+src/db/schema.ts                 seven migrations, seed category list
+src/db/repo.ts                   queries, dedup lookup, summaries, rules, categories
+src/parse/parse.ts               SMS/notification → transaction, self-transfer detection
+src/parse/categorize.ts          rule matching and the merchant keyword list
+src/sync.ts                      drain queue → parse → dedup → insert
+src/labels.ts                    row titles, provenance tags (SMS / NOTIF / PDF / MANUAL)
+src/period.ts                    half-open date ranges for every filter
+
+src/import/statement.ts          sniff format → parse → dedup → queue
 src/import/phonepe.ts            PhonePe statement PDF parser
-src/import/statement.ts          extract -> detect -> parse -> dedup -> queue
-src/screens/                     Home, Review, Add, History, Setup
+src/import/table.ts              bank-agnostic column mapper for sheets and CSV
+src/import/ole2.ts               OLE2 compound-file reader
+src/import/biff.ts               BIFF8 record reader for legacy .xls
+src/import/csv.ts                delimited text, RFC 4180 quoting
+
+src/backup/googleAuth.ts         Google OAuth, PKCE, drive.appdata only
+src/backup/drive.ts              Drive v3 REST against the hidden app folder
+src/backup/payload.ts            build / parse / apply a backup
+
+src/screens/                     Home, Review, Add, History, Setup, Categories, Rules
 modules/hisab-capture/           native Kotlin capture module
-  android/.../SmsReceiver.kt             SMS broadcast receiver
-  android/.../HisabNotificationListener.kt  payment-app notifications
-  android/.../CaptureStore.kt             native SQLite queue
-  android/.../TxnHeuristics.kt            pre-filter, payment app allowlist
+  android/.../SmsReceiver.kt                 SMS broadcast receiver
+  android/.../HisabNotificationListener.kt   payment-app notifications
+  android/.../CaptureStore.kt                native SQLite queue
+  android/.../PdfTextExtractor.kt            PDFBox text extraction
+  android/.../TxnHeuristics.kt               pre-filter, payment app allowlist
 ```
 
 ## Not built yet
@@ -325,5 +464,8 @@ modules/hisab-capture/           native Kotlin capture module
 - Budgets and per-category limits
 - Home-screen widget / quick-settings tile for cash
 - Recurring-payment detection
-- Statement parsers for banks other than PhonePe (HDFC, ICICI, SBI, Axis)
-- CSV / Excel statement import (more reliable than PDF where the bank offers it)
+- `.xlsx` import — needs a DEFLATE decoder to read the ZIP container
+- Statement PDF parsers beyond PhonePe — blocked on reading text positions from the native
+  extractor, since most banks' PDFs lose their table layout otherwise
+- Multi-device sync — the current backup is snapshot restore only, which is a deliberate choice:
+  merging two devices would need stable row IDs and tombstones, and this app has one user
