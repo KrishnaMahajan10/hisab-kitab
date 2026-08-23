@@ -27,6 +27,19 @@ const palette = {
   },
 };
 
+/**
+ * Launch identity, shared by the icon, the native splash configured in
+ * app.json and the in-app splash. Keep the two backgrounds in step with the
+ * expo-splash-screen plugin block so the handover shows no seam.
+ */
+export const brand = {
+  name: 'Hisab Kitab',
+  tagline: 'Every rupee, accounted for',
+  author: 'Krishna Mahajan',
+  splashBg: '#17348A',
+  splashBgDark: '#0E2264',
+};
+
 export type Theme = typeof palette.light;
 
 export function useTheme(): Theme {
