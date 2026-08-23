@@ -1,3 +1,5 @@
+<img src="assets/icon.png" width="88" alt="Hisab Kitab app icon">
+
 # Hisab Kitab
 
 **Android expense tracker that reads your transactions instead of asking you to type them.**
@@ -461,7 +463,9 @@ src/backup/googleAuth.ts         Google OAuth, PKCE, drive.appdata only
 src/backup/drive.ts              Drive v3 REST against the hidden app folder
 src/backup/payload.ts            build / parse / apply a backup
 
+src/components/Splash.tsx        launch screen, hands over from the native splash
 src/screens/                     Home, Review, Add, History, Setup, Categories, Rules
+scripts/gen-icons.mjs            renders every app icon and the splash mark, no image deps
 modules/hisab-capture/           native Kotlin capture module
   android/.../SmsReceiver.kt                 SMS broadcast receiver
   android/.../HisabNotificationListener.kt   payment-app notifications
@@ -481,3 +485,7 @@ modules/hisab-capture/           native Kotlin capture module
   extractor, since most banks' PDFs lose their table layout otherwise
 - Multi-device sync — the current backup is snapshot restore only, which is a deliberate choice:
   merging two devices would need stable row IDs and tombstones, and this app has one user
+
+## Credits
+
+Designed and implemented by **Krishna Mahajan**.

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Alert,
+  Image,
   Linking,
   PermissionsAndroid,
   Platform,
@@ -43,7 +44,7 @@ import RulesScreen from './RulesScreen';
 import { backfillLastDays } from '../sync';
 import { periodRange } from '../period';
 import { MAX_CYCLE_START_DAY, usePreferences } from '../preferences';
-import { formatMoney, spacing, useTheme } from '../theme';
+import { brand, formatMoney, spacing, useTheme } from '../theme';
 
 const ACCOUNT_KINDS: readonly AccountKind[] = [
   'credit_card',
@@ -664,6 +665,27 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
           />
         </View>
       </Card>
+
+      <SectionTitle>About</SectionTitle>
+      <Card>
+        <View style={styles.aboutRow}>
+          <Image
+            source={require('../../assets/icon.png')}
+            style={styles.aboutIcon}
+            accessibilityIgnoresInvertColors
+          />
+          <View style={styles.grow}>
+            <Text style={[styles.rowTitle, { color: theme.text }]}>{brand.name}</Text>
+            <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+              {brand.tagline}. Everything stays on this phone.
+            </Text>
+            <Text style={[styles.aboutCredit, { color: theme.textMuted }]}>
+              Designed &amp; implemented by{' '}
+              <Text style={{ color: theme.text, fontWeight: '700' }}>{brand.author}</Text>
+            </Text>
+          </View>
+        </View>
+      </Card>
     </ScrollView>
   );
 }
@@ -690,4 +712,7 @@ const styles = StyleSheet.create({
     marginTop: spacing.xs,
   },
   grow: { flex: 1 },
+  aboutRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.md },
+  aboutIcon: { width: 56, height: 56, borderRadius: 13 },
+  aboutCredit: { fontSize: 12, marginTop: spacing.sm, lineHeight: 17 },
 });

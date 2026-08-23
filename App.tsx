@@ -8,6 +8,7 @@ import {
 import { StatusBar } from 'expo-status-bar';
 import { SQLiteProvider, useSQLiteContext } from 'expo-sqlite';
 import * as Notifications from 'expo-notifications';
+import * as SplashScreen from 'expo-splash-screen';
 import { Ionicons } from '@expo/vector-icons';
 
 import HisabCapture from './modules/hisab-capture';
@@ -18,10 +19,14 @@ import ReviewScreen from './src/screens/ReviewScreen';
 import AddScreen from './src/screens/AddScreen';
 import HistoryScreen from './src/screens/HistoryScreen';
 import SetupScreen from './src/screens/SetupScreen';
+import Splash from './src/components/Splash';
 import { CategoriesProvider } from './src/categories';
 import { PreferencesProvider } from './src/preferences';
 import { drainCaptures } from './src/sync';
 import { spacing, useTheme } from './src/theme';
+
+// Hold the native splash until the in-app splash can take over without a flash.
+void SplashScreen.preventAutoHideAsync();
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -144,9 +149,31 @@ function Shell() {
 }
 
 export default function App() {
+  const [launching, setLaunching] = useState(true);
+  const finishLaunch = useCallback(() => setLaunching(false), []);
+
+  // This runs after the first paint, so the in-app splash is already covering
+  // the screen and the native splash can go. Releasing it here rather than from
+  // the splash component means a stalled animation can never strand the app
+  // behind it; a failed hide would do the same, so it retries.
+  useEffect(() => {
+    let cancelled = false;
+    const release = async () => {
+      try {
+        await SplashScreen.hideAsync();
+      } catch {
+        if (!cancelled) setTimeout(release, 600);
+      }
+    };
+    void release();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <SafeAreaProvider>
-      <StatusBar style="auto" />
+      <StatusBar style={launching ? 'light' : 'auto'} />
       <SQLiteProvider databaseName={DATABASE_NAME} onInit={migrate}>
         <PreferencesProvider>
           <CategoriesProvider>
@@ -154,6 +181,7 @@ export default function App() {
           </CategoriesProvider>
         </PreferencesProvider>
       </SQLiteProvider>
+      {launching ? <Splash onFinish={finishLaunch} /> : null}
     </SafeAreaProvider>
   );
 }
