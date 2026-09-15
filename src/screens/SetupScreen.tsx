@@ -12,6 +12,7 @@ import {
   View,
 } from 'react-native';
 import { useSQLiteContext } from 'expo-sqlite';
+import DateTimePicker from '@react-native-community/datetimepicker';
 import * as Notifications from 'expo-notifications';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
@@ -20,10 +21,14 @@ import { File, Paths } from 'expo-file-system';
 import HisabCapture from '../../modules/hisab-capture';
 import { Badge, Button, Card, ChipRow, SectionTitle } from '../components/ui';
 import {
+  balanceStanding,
   createAccount,
+  deleteBalanceSnapshot,
   listAccounts,
+  recordBalanceSnapshot,
   type Account,
   type AccountKind,
+  type BalanceStanding,
 } from '../db/repo';
 import {
   applyBackup,
@@ -41,10 +46,13 @@ import { importStatementFile, STATEMENT_MIME_TYPES } from '../import/statement';
 import CategoriesScreen from './CategoriesScreen';
 import PeopleScreen from './PeopleScreen';
 import RulesScreen from './RulesScreen';
-import { backfillLastDays } from '../sync';
+import { backfillSince } from '../sync';
+import { parseBalanceInput, readingTakenAt } from '../balance';
 import { periodRange } from '../period';
 import { MAX_CYCLE_START_DAY, usePreferences } from '../preferences';
-import { brand, formatMoney, spacing, useTheme } from '../theme';
+import { brand, formatDate, formatDateTime, formatMoney, spacing, useTheme } from '../theme';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const ACCOUNT_KINDS: readonly AccountKind[] = [
   'credit_card',
@@ -73,9 +81,14 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
   const [showCategories, setShowCategories] = useState(false);
   const [showPeople, setShowPeople] = useState(false);
   const [cycleDraft, setCycleDraft] = useState('');
+  const [standing, setStanding] = useState<BalanceStanding | null>(null);
+  const [balanceDraft, setBalanceDraft] = useState('');
+  const [balanceDate, setBalanceDate] = useState(() => new Date());
+  const [balancePicker, setBalancePicker] = useState(false);
 
   const refreshStatus = useCallback(async () => {
     setAccounts(await listAccounts(db));
+    setStanding(await balanceStanding(db));
     setDriveConnected(await isDriveConnected());
     setDriveLastBackup(await lastDriveBackupAt(db));
     try {
@@ -134,14 +147,21 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
     );
   };
 
-  // Shows the cycle the current setting produces, so the effect of the number
-  // is visible before it is trusted with the totals.
-  const cycleHint = useMemo(() => {
-    const range = periodRange('Month', new Date(), null, null, null, cycleStartDay);
-    return cycleStartDay === 1
-      ? `Calendar month — currently ${range.label}`
-      : `This month runs ${range.label}`;
-  }, [cycleStartDay]);
+  // The cycle the current setting produces, so the effect of the number is
+  // visible before it is trusted with the totals — and so the importer can line
+  // its scan up with the same boundary the totals use.
+  const cycleRange = useMemo(
+    () => periodRange('Month', new Date(), null, null, null, cycleStartDay),
+    [cycleStartDay]
+  );
+
+  // 'Month' always resolves to a bounded range; the null is only there for All.
+  const cycleStart = cycleRange.from ?? Date.now();
+
+  const cycleHint =
+    cycleStartDay === 1
+      ? `Calendar month — currently ${cycleRange.label}`
+      : `This month runs ${cycleRange.label}`;
 
   const saveCycleDay = async () => {
     const day = Number.parseInt(cycleDraft, 10);
@@ -159,6 +179,75 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
     onChanged();
   };
 
+  const balanceIsToday = useMemo(() => {
+    const today = new Date();
+    return (
+      balanceDate.getFullYear() === today.getFullYear() &&
+      balanceDate.getMonth() === today.getMonth() &&
+      balanceDate.getDate() === today.getDate()
+    );
+  }, [balanceDate]);
+
+  // Resolved on every render rather than pinned when the date was picked, so a
+  // reading saved as "today" is stamped with the moment Save was pressed.
+  const readingAt = readingTakenAt(balanceDate, new Date());
+
+  const balanceHint = balanceIsToday
+    ? 'Anything you already paid today is part of the figure you just read, so it is not taken off again. Only what comes in after this counts.'
+    : `Everything from the start of ${formatDate(readingAt)} counts against this reading.`;
+
+  const saveBalance = async () => {
+    const amountPaise = parseBalanceInput(balanceDraft);
+    if (amountPaise === null) {
+      Alert.alert(
+        'Enter a balance',
+        'Type what you have as a number, like 45000. Leave out the rupee sign.'
+      );
+      return;
+    }
+
+    setBusy(true);
+    try {
+      await recordBalanceSnapshot(db, {
+        amountPaise,
+        asOf: readingTakenAt(balanceDate, new Date()),
+      });
+      setBalanceDraft('');
+      setBalanceDate(new Date());
+      await refreshStatus();
+      onChanged();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Removing the latest reading falls back to the one before it, and the running
+   * balance re-applies everything since that older moment. That is the intended
+   * way out of a mistyped figure, so it is worth spelling out before it happens.
+   */
+  const confirmClearBalance = () => {
+    if (!standing) return;
+    Alert.alert(
+      'Remove this reading?',
+      'The balance goes back to whatever you said before it, or disappears if this was your first.',
+      [
+        { text: 'Keep it', style: 'cancel' },
+        {
+          text: 'Remove',
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              await deleteBalanceSnapshot(db, standing.snapshot.id);
+              await refreshStatus();
+              onChanged();
+            })();
+          },
+        },
+      ]
+    );
+  };
+
   const requestNotifications = async () => {
     await Notifications.requestPermissionsAsync();
     await Notifications.setNotificationChannelAsync('hisab_capture', {
@@ -167,13 +256,13 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
     });
   };
 
-  const runBackfill = async (days: number) => {
+  const runBackfill = async (since: number) => {
     if (!smsGranted) {
       Alert.alert('SMS access needed', 'Grant SMS permission first.');
       return;
     }
     setBusy(true);
-    const result = await backfillLastDays(db, days);
+    const result = await backfillSince(db, since);
     setBusy(false);
     onChanged();
     Alert.alert(
@@ -440,17 +529,25 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
       <Card>
         <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
           Scan SMS already on this phone and queue anything that looks like a transaction.
+          Anything already captured is skipped, so scanning twice costs nothing.
         </Text>
+        <Button
+          label={`This cycle — since ${formatDate(cycleStart)}`}
+          tone="primary"
+          onPress={() => void runBackfill(cycleStart)}
+          disabled={busy}
+          style={styles.spaced}
+        />
         <View style={styles.buttonRow}>
           <Button
             label="Last 30 days"
-            onPress={() => void runBackfill(30)}
+            onPress={() => void runBackfill(Date.now() - 30 * DAY_MS)}
             disabled={busy}
             style={styles.grow}
           />
           <Button
             label="Last 90 days"
-            onPress={() => void runBackfill(90)}
+            onPress={() => void runBackfill(Date.now() - 90 * DAY_MS)}
             disabled={busy}
             style={styles.grow}
           />
@@ -549,6 +646,83 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
           onPress={() => setShowPeople(true)}
           style={styles.spaced}
         />
+      </Card>
+
+      <SectionTitle>Balance</SectionTitle>
+      <Card>
+        <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+          Hisab only ever sees money moving, so it cannot know what you actually
+          have until you say so once. Put in what you have right now and every
+          payment captured after this moment is applied on top, so the Home screen
+          can show what your balance should be and you can tally it against your
+          bank app.
+        </Text>
+
+        {standing ? (
+          <View style={[styles.statusRow, styles.spaced]}>
+            <View style={styles.grow}>
+              <Text style={[styles.rowTitle, { color: theme.text }]}>
+                {standing.balance < 0 ? '−' : ''}
+                {formatMoney(standing.balance)} now
+              </Text>
+              <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+                Reading of {formatMoney(standing.snapshot.amount_paise)} taken{' '}
+                {formatDateTime(standing.snapshot.as_of)}
+              </Text>
+            </View>
+            <Button
+              label="Remove"
+              tone="danger"
+              onPress={confirmClearBalance}
+              disabled={busy}
+            />
+          </View>
+        ) : null}
+
+        <Text style={[styles.label, { color: theme.textMuted }]}>
+          {standing ? 'New reading' : 'What you have now'}
+        </Text>
+        <TextInput
+          value={balanceDraft}
+          onChangeText={setBalanceDraft}
+          keyboardType="decimal-pad"
+          placeholder="45000"
+          placeholderTextColor={theme.textMuted}
+          style={[
+            styles.input,
+            { color: theme.text, backgroundColor: theme.surfaceAlt, borderColor: theme.border },
+          ]}
+        />
+
+        <Text style={[styles.label, { color: theme.textMuted }]}>As of</Text>
+        <Button
+          label={balanceIsToday ? 'Today' : formatDate(readingAt)}
+          onPress={() => setBalancePicker(true)}
+          style={styles.spaced}
+        />
+        <Text style={[styles.rowMeta, { color: theme.textMuted }]}>{balanceHint}</Text>
+
+        <Button
+          label={standing ? 'Save new reading' : 'Save balance'}
+          tone="primary"
+          onPress={() => void saveBalance()}
+          disabled={busy}
+          style={styles.spaced}
+        />
+
+        {balancePicker ? (
+          <DateTimePicker
+            value={balanceDate}
+            mode="date"
+            maximumDate={new Date()}
+            display={Platform.OS === 'android' ? 'calendar' : 'default'}
+            onChange={(event, selected) => {
+              setBalancePicker(false);
+              if (event.type === 'dismissed' || !selected) return;
+              setBalanceDate(selected);
+            }}
+          />
+        ) : null}
       </Card>
 
       <SectionTitle>Monthly cycle</SectionTitle>
