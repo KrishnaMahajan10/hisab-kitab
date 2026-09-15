@@ -5,10 +5,14 @@ import { useSQLiteContext } from 'expo-sqlite';
 import { Card, EmptyState, SectionTitle } from '../components/ui';
 import { PeriodFilter, usePeriod } from '../components/PeriodFilter';
 import {
+  accountStandings,
   balanceStanding,
   rangeSummary,
+  unassignedStanding,
+  type AccountStanding,
   type BalanceStanding,
   type RangeSummary,
+  type UnassignedStanding,
 } from '../db/repo';
 import { drainCaptures } from '../sync';
 import { formatDateTime, formatMoney, spacing, useTheme } from '../theme';
@@ -27,13 +31,17 @@ export default function HomeScreen({
 
   const [summary, setSummary] = useState<RangeSummary | null>(null);
   const [standing, setStanding] = useState<BalanceStanding | null>(null);
+  const [accountStands, setAccountStands] = useState<AccountStanding[]>([]);
+  const [unassigned, setUnassigned] = useState<UnassignedStanding | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
     setSummary(await rangeSummary(db, range.from, range.to));
-    // The balance stands on its own reading, not on the period being viewed:
+    // Balances stand on their own readings, not on the period being viewed:
     // switching to last month must not change what you have right now.
     setStanding(await balanceStanding(db));
+    setAccountStands(await accountStandings(db));
+    setUnassigned(await unassignedStanding(db));
   }, [db, range.from, range.to]);
 
   useEffect(() => {
@@ -56,6 +64,16 @@ export default function HomeScreen({
   const count = summary?.count ?? 0;
   const maxCategory = summary?.byCategory[0]?.total ?? 1;
   const isEmpty = count === 0;
+
+  // Signed, because unattributed money can land either way: a UPI spend and a
+  // refund that never named a card both end up here.
+  const unassignedNet = unassigned
+    ? unassigned.flow.inflow - unassigned.flow.outflow
+    : 0;
+
+  const hasUnassigned = unassigned
+    ? unassigned.flow.inflow + unassigned.flow.outflow > 0
+    : false;
 
   return (
     <ScrollView
@@ -119,6 +137,46 @@ export default function HomeScreen({
           </Text>
         </Card>
       )}
+
+      {accountStands.some((entry) => entry.balance !== null) ? (
+        <Card>
+          <Text style={[styles.label, { color: theme.textMuted }]}>By account</Text>
+          {accountStands.map((entry) => (
+            <View key={entry.account.id} style={styles.listRow}>
+              <Text style={[styles.rowTitle, { color: theme.text }]}>{entry.account.name}</Text>
+              <Text
+                style={[
+                  styles.rowValue,
+                  { color: entry.balance === null ? theme.textMuted : theme.text },
+                ]}>
+                {entry.balance === null
+                  ? 'Not set'
+                  : `${entry.balance < 0 ? '−' : ''}${formatMoney(entry.balance)}`}
+              </Text>
+            </View>
+          ))}
+
+          {/* Only a bank SMS naming a card attributes itself. Everything else
+              lands here, and hiding it would let the account rows quietly add up
+              to more money than you actually have. */}
+          {hasUnassigned ? (
+            <>
+              <View style={styles.listRow}>
+                <Text style={[styles.rowTitle, { color: theme.textMuted }]}>Unassigned</Text>
+                <Text style={[styles.rowValue, { color: theme.textMuted }]}>
+                  {unassignedNet <= 0 ? '−' : '+'}
+                  {formatMoney(unassignedNet)}
+                </Text>
+              </View>
+              <Text style={[styles.movedNote, { color: theme.textMuted }]}>
+                Not tied to any account, so it moves none of the figures above — the overall
+                balance already counts it. Set the account on those rows in History to place
+                them.
+              </Text>
+            </>
+          ) : null}
+        </Card>
+      ) : null}
 
       <Card style={styles.headline}>
         <Text style={[styles.rangeLabel, { color: theme.textMuted }]}>{range.label}</Text>

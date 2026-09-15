@@ -204,6 +204,23 @@ Unreviewed rows are held back from the headline and offered separately ("3 still
 confirm them and this becomes ₹41,200"), so a number that has not been checked yet can never quietly
 move your balance.
 
+#### Per-account balances
+
+An account carries its own reading too. Adding one by hand requires a balance — type `0` for an
+account that really is empty, which is a reading, unlike never having set one. Accounts the app
+created for you never passed through that form: **Cash** is seeded on first run, and a `Card ••1234`
+appears the moment a bank message names a card you had not added. Both show **Set balance** in the
+account list and take a reading when tapped.
+
+Only payments tagged with an account move that account's balance, and only a bank SMS naming a card
+is tagged automatically. UPI and wallet notifications usually carry no card number, so they land
+with no account at all. Rather than hide that, Home reports it as an **Unassigned** row: the money
+is real, the overall reading already counts it, and showing it keeps the per-account rows from
+quietly adding up to more than you have. Set the account on those rows in History to place them.
+
+This is why the overall reading stays the authoritative figure. It counts every payment whether or
+not the message it came from named a card, so it is the one that cannot drift.
+
 The reading and the monthly cycle are independent. You can take a reading today while your months
 still run from the 7th: the cycle decides which spending is grouped together, the reading decides
 where the running total starts.
@@ -488,7 +505,7 @@ allow with a disclosure.
 ```
 App.tsx                          tabs, DB provider, live capture wiring
 src/categories.tsx               the live category list, read by every picker
-src/db/schema.ts                 nine migrations, seed category list
+src/db/schema.ts                 ten migrations, seed category list
 src/db/repo.ts                   queries, dedup lookup, summaries, rules, categories
 src/parse/parse.ts               SMS/notification → transaction, self-transfer detection
 src/parse/categorize.ts          rule matching and the merchant keyword list

@@ -3,7 +3,7 @@ import type { SQLiteDatabase } from 'expo-sqlite';
 import { extractReference } from '../parse/parse';
 
 export const DATABASE_NAME = 'hisab.db';
-const DATABASE_VERSION = 9;
+const DATABASE_VERSION = 10;
 
 export const EXPENSE_CATEGORIES = [
   'Food & Dining',
@@ -367,6 +367,23 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
       );
 
       CREATE INDEX idx_balance_as_of ON balance_snapshots (as_of DESC, id DESC);
+    `);
+  }
+
+  if (current < 10) {
+    // A reading can now belong to one account rather than to everything you
+    // own. A null account is the overall reading, which is still the figure
+    // that cannot drift: it counts every payment whether or not the message it
+    // came from named a card, while a per-account reading only ever sees the
+    // rows that were actually attributed to that account.
+    await db.execAsync(`
+      ALTER TABLE balance_snapshots
+        ADD COLUMN account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE
+    `);
+
+    await db.execAsync(`
+      CREATE INDEX idx_balance_account
+        ON balance_snapshots (account_id, as_of DESC, id DESC)
     `);
   }
 

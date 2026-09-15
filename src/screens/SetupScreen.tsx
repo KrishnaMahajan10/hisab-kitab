@@ -4,6 +4,7 @@ import {
   Image,
   Linking,
   PermissionsAndroid,
+  Pressable,
   Platform,
   ScrollView,
   StyleSheet,
@@ -21,6 +22,7 @@ import { File, Paths } from 'expo-file-system';
 import HisabCapture from '../../modules/hisab-capture';
 import { Badge, Button, Card, ChipRow, SectionTitle } from '../components/ui';
 import {
+  accountStandings,
   balanceStanding,
   createAccount,
   deleteBalanceSnapshot,
@@ -28,6 +30,7 @@ import {
   recordBalanceSnapshot,
   type Account,
   type AccountKind,
+  type AccountStanding,
   type BalanceStanding,
 } from '../db/repo';
 import {
@@ -85,10 +88,15 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
   const [balanceDraft, setBalanceDraft] = useState('');
   const [balanceDate, setBalanceDate] = useState(() => new Date());
   const [balancePicker, setBalancePicker] = useState(false);
+  const [accountBalanceDraft, setAccountBalanceDraft] = useState('');
+  const [accountStands, setAccountStands] = useState<AccountStanding[]>([]);
+  const [editingAccount, setEditingAccount] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState('');
 
   const refreshStatus = useCallback(async () => {
     setAccounts(await listAccounts(db));
     setStanding(await balanceStanding(db));
+    setAccountStands(await accountStandings(db));
     setDriveConnected(await isDriveConnected());
     setDriveLastBackup(await lastDriveBackupAt(db));
     try {
@@ -320,6 +328,35 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
     Alert.alert('Import failed', outcome.message);
   };
 
+  /**
+   * Cash is seeded on first run and a "Card ••1234" is created the moment a bank
+   * message names one, so neither ever passes through the add form. Without this
+   * those accounts could never be given a balance at all.
+   */
+  const startEditingAccount = (entry: AccountStanding) => {
+    setEditingAccount(entry.account.id);
+    setEditDraft(entry.balance === null ? '' : String(entry.balance / 100));
+  };
+
+  const saveAccountBalance = async (accountId: number) => {
+    const amountPaise = parseBalanceInput(editDraft);
+    if (amountPaise === null) {
+      Alert.alert(
+        'Enter a balance',
+        'Type what is in this account right now, like 45000. Type 0 if it is empty.'
+      );
+      return;
+    }
+
+    // A fresh reading rather than an edit of the old one: what the account held
+    // last month is still true of last month, and the row is worth keeping.
+    await recordBalanceSnapshot(db, { accountId, amountPaise, asOf: Date.now() });
+    setEditingAccount(null);
+    setEditDraft('');
+    await refreshStatus();
+    onChanged();
+  };
+
   const addAccount = async () => {
     const trimmed = name.trim();
     if (!trimmed) {
@@ -331,8 +368,21 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
       Alert.alert('Invalid last 4', 'Enter exactly 4 digits, or leave it blank.');
       return;
     }
+    // An account added by hand has to start with a balance, or it can never say
+    // anything useful: with no reading there is nothing for its payments to move.
+    // Type 0 for an account that really is empty.
+    const openingPaise = parseBalanceInput(accountBalanceDraft);
+    if (openingPaise === null) {
+      Alert.alert(
+        'Balance required',
+        'Enter what is in this account right now, as a number like 45000. Type 0 if it is empty.'
+      );
+      return;
+    }
+
+    let accountId: number;
     try {
-      await createAccount(db, {
+      accountId = await createAccount(db, {
         name: trimmed,
         kind,
         last4: digits.length === 4 ? digits : null,
@@ -341,8 +391,16 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
       Alert.alert('Already exists', 'An account with those last 4 digits already exists.');
       return;
     }
+
+    await recordBalanceSnapshot(db, {
+      accountId,
+      amountPaise: openingPaise,
+      asOf: Date.now(),
+    });
+
     setName('');
     setLast4('');
+    setAccountBalanceDraft('');
     await refreshStatus();
     onChanged();
   };
@@ -584,20 +642,79 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
 
       <SectionTitle>Accounts</SectionTitle>
       <Card>
-        {accounts.map((account) => (
-          <View key={account.id} style={styles.statusRow}>
-            <View style={styles.grow}>
-              <Text style={[styles.rowTitle, { color: theme.text }]}>{account.name}</Text>
-              <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
-                {account.kind.replace('_', ' ')}
-                {account.last4 ? ` · ••${account.last4}` : ''}
+        {accountStands.map((entry) => (
+          <View key={entry.account.id}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`Set the balance of ${entry.account.name}`}
+              onPress={() => startEditingAccount(entry)}
+              style={styles.statusRow}>
+              <View style={styles.grow}>
+                <Text style={[styles.rowTitle, { color: theme.text }]}>
+                  {entry.account.name}
+                </Text>
+                <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+                  {entry.account.kind.replace('_', ' ')}
+                  {entry.account.last4 ? ` · ••${entry.account.last4}` : ''}
+                </Text>
+              </View>
+              {/* A balance nobody has set is unknown, not zero — saying ₹0.00
+                  here would be the app inventing a number it was never told. */}
+              <Text
+                style={[
+                  entry.balance === null ? styles.rowMeta : styles.rowTitle,
+                  { color: entry.balance === null ? theme.warn : theme.text },
+                ]}>
+                {entry.balance === null
+                  ? 'Set balance'
+                  : `${entry.balance < 0 ? '−' : ''}${formatMoney(entry.balance)}`}
               </Text>
-            </View>
-            <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
-              {formatMoney(account.opening_balance)}
-            </Text>
+            </Pressable>
+
+            {editingAccount === entry.account.id ? (
+              <View style={styles.spaced}>
+                <TextInput
+                  value={editDraft}
+                  onChangeText={setEditDraft}
+                  keyboardType="decimal-pad"
+                  autoFocus
+                  placeholder="45000 — type 0 if it is empty"
+                  placeholderTextColor={theme.textMuted}
+                  style={[
+                    styles.input,
+                    {
+                      color: theme.text,
+                      backgroundColor: theme.surfaceAlt,
+                      borderColor: theme.border,
+                    },
+                  ]}
+                />
+                <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+                  Read as of now. Everything tagged with this account moves it from here on.
+                </Text>
+                <View style={styles.buttonRow}>
+                  <Button
+                    label="Cancel"
+                    onPress={() => setEditingAccount(null)}
+                    style={styles.grow}
+                  />
+                  <Button
+                    label="Save balance"
+                    tone="primary"
+                    onPress={() => void saveAccountBalance(entry.account.id)}
+                    style={styles.grow}
+                  />
+                </View>
+              </View>
+            ) : null}
           </View>
         ))}
+        {accountStands.length === 0 ? (
+          <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+            No accounts yet. One is created automatically the first time a bank message names a
+            card you have not added.
+          </Text>
+        ) : null}
       </Card>
 
       <Card>
@@ -627,6 +744,23 @@ export default function SetupScreen({ onChanged }: { onChanged: () => void }) {
             { color: theme.text, backgroundColor: theme.surfaceAlt, borderColor: theme.border },
           ]}
         />
+        <Text style={[styles.label, { color: theme.textMuted }]}>Balance now</Text>
+        <TextInput
+          value={accountBalanceDraft}
+          onChangeText={setAccountBalanceDraft}
+          keyboardType="decimal-pad"
+          placeholder="45000 — type 0 if it is empty"
+          placeholderTextColor={theme.textMuted}
+          style={[
+            styles.input,
+            { color: theme.text, backgroundColor: theme.surfaceAlt, borderColor: theme.border },
+          ]}
+        />
+        <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+          Taken as of now, and every payment tagged with this account moves it from here on. A
+          bank SMS has to name the card for that to happen automatically — UPI and wallet alerts
+          usually do not, so set the account by hand in Review when it matters.
+        </Text>
         <Button
           label="Add account"
           tone="primary"
