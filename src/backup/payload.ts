@@ -8,6 +8,7 @@ export const BACKUP_TABLES = [
   'transactions',
   'category_rules',
   'splits',
+  'balance_snapshots',
 ] as const;
 
 export type BackupPayload = {
@@ -21,6 +22,7 @@ export type BackupPayload = {
   transactions: unknown[];
   category_rules: unknown[];
   splits: unknown[];
+  balance_snapshots: unknown[];
 };
 
 async function schemaVersion(db: SQLiteDatabase): Promise<number> {
@@ -62,6 +64,7 @@ export async function applyBackup(db: SQLiteDatabase, payload: BackupPayload): P
   }
 
   await db.withTransactionAsync(async () => {
+    await db.execAsync('DELETE FROM balance_snapshots');
     await db.execAsync('DELETE FROM splits');
     await db.execAsync('DELETE FROM transactions');
     await db.execAsync('DELETE FROM people');

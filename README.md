@@ -95,6 +95,7 @@ existing transaction pointing at the right one.
 - **Sorts spending** — ~300 Indian merchant keywords, plus rules you write yourself
 - **Categories you control** — add, rename and hide them; renaming updates every transaction
 - **Honest totals** — self-transfers, card payments and cash withdrawals are money moved, not spent
+- **A balance you can tally** — say what you have once, and every capture after it is applied on top
 - **Filters** — day, week, month, a specific month, year, or a custom range
 - **Backup** — one file in a private Google Drive folder, or a JSON export you keep yourself
 
@@ -172,6 +173,44 @@ screen state what they cover.
 
 Home and History share one filter component (`src/components/PeriodFilter.tsx`) and one range
 calculation (`src/period.ts`), so the two screens can never disagree about what "this week" means.
+
+### Balance
+
+Hisab only ever sees money moving, so it cannot know what you have. **Setup → Balance** is where you
+say so once: type what you have now, and Home shows what your balance should be from then on.
+
+The reading is stamped with the moment it was taken. A reading entered today is true *as of now* —
+what you already paid this morning is part of the figure you just read off your bank app, so
+subtracting it again would report money you no longer have. A back-dated reading is taken at the
+start of its day instead, because "I had ₹5,000 on the 7th" is a claim about the day, and the 7th's
+own spending still counts against it.
+
+From there:
+
+```
+balance = reading + money in − money out
+```
+
+Two rules keep that figure honest, and both differ from the spending totals on purpose:
+
+- **Money that only changed pots is never applied.** A self-transfer, an ATM withdrawal and a card
+  bill all move your own money around. Taking a card bill off would charge you twice for spends the
+  card's own messages already recorded.
+- **A shared payment counts at full face value.** The whole sum left your account that day even
+  though part of it was somebody else's share, and it comes back as its own credit when they pay
+  you. The spending total counts only your share; the balance counts what actually left.
+
+Unreviewed rows are held back from the headline and offered separately ("3 still waiting in Review —
+confirm them and this becomes ₹41,200"), so a number that has not been checked yet can never quietly
+move your balance.
+
+The reading and the monthly cycle are independent. You can take a reading today while your months
+still run from the 7th: the cycle decides which spending is grouped together, the reading decides
+where the running total starts.
+
+When the figure stops matching your bank, something went uncaptured — that gap is the point of the
+feature. Fix it in Review, or enter a fresh reading and start again from today. Readings are kept
+rather than overwritten, so removing one falls back to the one before it.
 
 ## History
 
@@ -377,7 +416,10 @@ After install, open **Setup** and grant:
 2. **Notification access** — opens the system special-access screen; toggle Hisab Kitab on
 3. **Reminder notifications** — so Hisab Kitab can nudge you when items are waiting
 
-Then use **Import history** to scan SMS already on the phone (last 30 or 90 days) and backfill.
+Then use **Import history** to scan SMS already on the phone and backfill. **This cycle** scans from
+the day your month starts — the same boundary the totals use — so a fresh install lines up with the
+period you actually read; **Last 30 days** and **Last 90 days** reach further back. Anything already
+captured is skipped, so scanning twice costs nothing.
 
 ## Checks
 
@@ -393,7 +435,7 @@ npm test
 Axis, Kotak), payment-app notifications, and noise samples (OTPs, promos, balance-only alerts) that
 must be rejected.
 
-Eleven suites in total, each a plain assertion script run by `tsx` — no test framework, and every
+Thirteen suites in total, each a plain assertion script run by `tsx` — no test framework, and every
 suite finishes in under a second.
 
 | Script | Covers |
@@ -409,6 +451,8 @@ suite finishes in under a second.
 | `npm run test:labels` | Row titles and provenance tags |
 | `npm run test:totals` | Which categories count toward spending |
 | `npm run test:backup` | Backup payload, and refusing a newer-schema restore |
+| `npm run test:splits` | Even shares that add up, and who owes what |
+| `npm run test:balance` | Balance projection, and when a reading is true |
 
 Every test asserts a behaviour rather than an implementation detail, and several exist specifically
 to pin down a bug that was found and fixed — a spread that would blow the stack on a large sheet, a
@@ -444,13 +488,14 @@ allow with a disclosure.
 ```
 App.tsx                          tabs, DB provider, live capture wiring
 src/categories.tsx               the live category list, read by every picker
-src/db/schema.ts                 seven migrations, seed category list
+src/db/schema.ts                 nine migrations, seed category list
 src/db/repo.ts                   queries, dedup lookup, summaries, rules, categories
 src/parse/parse.ts               SMS/notification → transaction, self-transfer detection
 src/parse/categorize.ts          rule matching and the merchant keyword list
 src/sync.ts                      drain queue → parse → dedup → insert
 src/labels.ts                    row titles, provenance tags (SMS / NOTIF / PDF / MANUAL)
 src/period.ts                    half-open date ranges for every filter
+src/balance.ts                   a reading, and the balance it implies now
 
 src/import/statement.ts          sniff format → parse → dedup → queue
 src/import/phonepe.ts            PhonePe statement PDF parser

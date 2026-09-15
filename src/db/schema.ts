@@ -3,7 +3,7 @@ import type { SQLiteDatabase } from 'expo-sqlite';
 import { extractReference } from '../parse/parse';
 
 export const DATABASE_NAME = 'hisab.db';
-const DATABASE_VERSION = 8;
+const DATABASE_VERSION = 9;
 
 export const EXPENSE_CATEGORIES = [
   'Food & Dining',
@@ -346,6 +346,28 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
                (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories), 1, ?)`,
       [Date.now()]
     );
+  }
+
+  if (current < 9) {
+    // The app only ever sees money moving, so it cannot know what you actually
+    // have until you say so once. A snapshot is that reading: an amount and the
+    // moment it was true. Everything captured after it is applied on top, giving
+    // a balance you can hold against your bank app.
+    //
+    // Readings are kept rather than overwritten, so re-tallying next month
+    // leaves a trail of what you said and when, and one typed wrong can be
+    // removed to fall back on the reading before it.
+    await db.execAsync(`
+      CREATE TABLE balance_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        amount_paise INTEGER NOT NULL,
+        as_of INTEGER NOT NULL,
+        note TEXT,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX idx_balance_as_of ON balance_snapshots (as_of DESC, id DESC);
+    `);
   }
 
   await db.execAsync(`PRAGMA user_version = ${DATABASE_VERSION}`);

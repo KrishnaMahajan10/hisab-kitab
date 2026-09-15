@@ -4,9 +4,14 @@ import { useSQLiteContext } from 'expo-sqlite';
 
 import { Card, EmptyState, SectionTitle } from '../components/ui';
 import { PeriodFilter, usePeriod } from '../components/PeriodFilter';
-import { rangeSummary, type RangeSummary } from '../db/repo';
+import {
+  balanceStanding,
+  rangeSummary,
+  type BalanceStanding,
+  type RangeSummary,
+} from '../db/repo';
 import { drainCaptures } from '../sync';
-import { formatMoney, spacing, useTheme } from '../theme';
+import { formatDateTime, formatMoney, spacing, useTheme } from '../theme';
 
 export default function HomeScreen({
   refreshToken,
@@ -21,10 +26,14 @@ export default function HomeScreen({
   const { range } = periodState;
 
   const [summary, setSummary] = useState<RangeSummary | null>(null);
+  const [standing, setStanding] = useState<BalanceStanding | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   const load = useCallback(async () => {
     setSummary(await rangeSummary(db, range.from, range.to));
+    // The balance stands on its own reading, not on the period being viewed:
+    // switching to last month must not change what you have right now.
+    setStanding(await balanceStanding(db));
   }, [db, range.from, range.to]);
 
   useEffect(() => {
@@ -56,6 +65,60 @@ export default function HomeScreen({
         <RefreshControl refreshing={refreshing} onRefresh={refresh} tintColor={theme.accent} />
       }>
       <PeriodFilter state={periodState} showLabel={false} />
+
+      <SectionTitle>Balance</SectionTitle>
+      {standing ? (
+        <Card>
+          <Text style={[styles.label, { color: theme.textMuted }]}>Should be left</Text>
+          <Text style={[styles.big, { color: theme.text }]}>
+            {standing.balance < 0 ? '−' : ''}
+            {formatMoney(standing.balance)}
+          </Text>
+          <Text style={[styles.movedNote, { color: theme.textMuted }]}>
+            From {formatMoney(standing.snapshot.amount_paise)} you entered{' '}
+            {formatDateTime(standing.snapshot.as_of)}
+          </Text>
+          <View style={styles.splitRow}>
+            <View style={styles.splitItem}>
+              <Text style={[styles.label, { color: theme.textMuted }]}>In since</Text>
+              <Text style={[styles.medium, { color: theme.credit }]}>
+                {formatMoney(standing.flow.inflow)}
+              </Text>
+            </View>
+            <View style={styles.splitItem}>
+              <Text style={[styles.label, { color: theme.textMuted }]}>Out since</Text>
+              <Text style={[styles.medium, { color: theme.debit }]}>
+                {formatMoney(standing.flow.outflow)}
+              </Text>
+            </View>
+          </View>
+          {standing.flow.pendingCount > 0 ? (
+            <Text style={[styles.movedNote, { color: theme.textMuted }]}>
+              {standing.flow.pendingCount} still waiting in Review — confirm them and this
+              becomes {standing.balanceWithPending < 0 ? '−' : ''}
+              {formatMoney(standing.balanceWithPending)}
+            </Text>
+          ) : null}
+          {standing.flow.moved > 0 ? (
+            <Text style={[styles.movedNote, { color: theme.textMuted }]}>
+              {formatMoney(standing.flow.moved)} only changed pots since then — moved between
+              your own accounts, drawn as cash or paid onto a card, so it is not taken off here
+            </Text>
+          ) : null}
+          <Text style={[styles.movedNote, { color: theme.textMuted }]}>
+            Not matching your bank? Something went uncaptured — check Review, or enter a fresh
+            balance in Setup to start again from today.
+          </Text>
+        </Card>
+      ) : (
+        <Card>
+          <Text style={[styles.rowMeta, { color: theme.textMuted }]}>
+            Hisab sees payments, not balances, so it cannot say what you have left until you
+            tell it once. Enter what you have now under Setup → Balance and this shows what your
+            balance should be from here on, whatever day your month starts.
+          </Text>
+        </Card>
+      )}
 
       <Card style={styles.headline}>
         <Text style={[styles.rangeLabel, { color: theme.textMuted }]}>{range.label}</Text>
@@ -155,6 +218,7 @@ const styles = StyleSheet.create({
   label: { fontSize: 11, fontWeight: '700', letterSpacing: 0.6, textTransform: 'uppercase' },
   big: { fontSize: 34, fontWeight: '800', marginTop: spacing.xs },
   movedNote: { fontSize: 11, lineHeight: 16, marginTop: spacing.md },
+  rowMeta: { fontSize: 12, lineHeight: 17 },
   medium: { fontSize: 17, fontWeight: '700', marginTop: 2 },
   splitRow: { flexDirection: 'row', gap: spacing.lg, marginTop: spacing.lg },
   splitItem: { flex: 1 },

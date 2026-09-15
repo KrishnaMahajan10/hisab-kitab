@@ -42,6 +42,7 @@ async function main(): Promise<void> {
   splits: [{ id: 1, transaction_id: 7, person_id: 1, amount_paise: 30000, direction: 'owed_to_me' }],
     transactions: [{ id: 7, amount_paise: 12300, reference: '523401' }],
     category_rules: [{ pattern: 'swiggy', category: 'Food & Dining' }],
+    balance_snapshots: [{ id: 1, amount_paise: 4500000, as_of: 1757203200000 }],
   });
 
   const built = await buildBackup(source.db);
@@ -51,6 +52,7 @@ async function main(): Promise<void> {
   check('custom categories are included', built.categories.length === 1);
   check('transactions are included', built.transactions.length === 1);
   check('rules are included', built.category_rules.length === 1);
+  check('balance readings are included', built.balance_snapshots.length === 1);
   check('exportedAt is ISO', !Number.isNaN(Date.parse(built.exportedAt)), built.exportedAt);
 
   const roundTripped = parseBackup(JSON.stringify(built));
@@ -79,8 +81,8 @@ async function main(): Promise<void> {
   await applyBackup(target.db, built);
   const deletes = target.log.filter((entry) => entry.sql.startsWith('DELETE'));
   const inserts = target.log.filter((entry) => entry.sql.startsWith('INSERT'));
-  check('every table is cleared', deletes.length === 6, String(deletes.length));
-  check('every row is reinserted', inserts.length === 6, String(inserts.length));
+  check('every table is cleared', deletes.length === 7, String(deletes.length));
+  check('every row is reinserted', inserts.length === 7, String(inserts.length));
   // Splits point at both a transaction and a person, so all three have to come
   // back or a restored ledger would owe money to nobody.
   check(
@@ -101,6 +103,12 @@ async function main(): Promise<void> {
     target.log.findIndex((e) => e.sql.includes('INTO accounts')) <
       target.log.findIndex((e) => e.sql.includes('INTO transactions'))
   );
+  // Without this the balance you typed is lost on every restore, and the
+  // running total silently starts from nothing.
+  check(
+    'the balance reading survives the round trip',
+    inserts.some((entry) => entry.params.includes(4500000))
+  );
   check(
     'reference survives the round trip',
     inserts.some((entry) => entry.params.includes('523401'))
@@ -112,7 +120,7 @@ async function main(): Promise<void> {
   await applyBackup(forward.db, { ...built, schemaVersion: 2 } as BackupPayload);
   check(
     'older-schema backup still restores',
-    forward.log.filter((entry) => entry.sql.startsWith('INSERT')).length === 6
+    forward.log.filter((entry) => entry.sql.startsWith('INSERT')).length === 7
   );
 
   console.log(failures === 0 ? '\nAll assertions passed\n' : `\n${failures} assertion(s) failed\n`);

@@ -7,6 +7,11 @@ import {
   type RuleField,
 } from '../parse/categorize';
 import { captureOrigin, type CaptureOrigin } from '../labels';
+import {
+  projectBalance,
+  projectBalanceWithPending,
+  type BalanceFlow,
+} from '../balance';
 import type { SplitDirection } from '../splits';
 import {
   CROSS_SOURCE_WINDOW_MS,
@@ -752,6 +757,109 @@ export async function rangeSummary(
     lent: totals?.lent ?? 0,
     byCategory,
     byAccount,
+  };
+}
+
+export type BalanceSnapshot = {
+  id: number;
+  amount_paise: number;
+  as_of: number;
+  note: string | null;
+  created_at: number;
+};
+
+/**
+ * The reading the running balance is built on: the most recent one by the
+ * moment it describes, and by insert order when two describe the same moment.
+ */
+export async function latestBalanceSnapshot(
+  db: SQLiteDatabase
+): Promise<BalanceSnapshot | null> {
+  return db.getFirstAsync<BalanceSnapshot>(
+    'SELECT * FROM balance_snapshots ORDER BY as_of DESC, id DESC LIMIT 1'
+  );
+}
+
+export async function recordBalanceSnapshot(
+  db: SQLiteDatabase,
+  input: { amountPaise: number; asOf: number; note?: string | null }
+): Promise<number> {
+  const result = await db.runAsync(
+    `INSERT INTO balance_snapshots (amount_paise, as_of, note, created_at)
+     VALUES (?, ?, ?, ?)`,
+    [Math.round(input.amountPaise), input.asOf, input.note ?? null, Date.now()]
+  );
+  return result.lastInsertRowId;
+}
+
+export async function deleteBalanceSnapshot(db: SQLiteDatabase, id: number): Promise<void> {
+  await db.runAsync('DELETE FROM balance_snapshots WHERE id = ?', [id]);
+}
+
+/**
+ * Everything that has happened to your money since a reading was taken.
+ *
+ * Unlike the period totals this counts a shared payment at its full amount: the
+ * whole sum left your account on the day, and a friend's share only comes back
+ * when they actually pay it. Relocations between your own pots are reported
+ * separately and never applied, so a card bill cannot take the same money off
+ * twice after the card's own spends were already counted.
+ */
+export async function flowSince(db: SQLiteDatabase, from: number): Promise<BalanceFlow> {
+  const row = await db.getFirstAsync<{
+    inflow: number | null;
+    outflow: number | null;
+    moved: number | null;
+    pending_in: number | null;
+    pending_out: number | null;
+    pending_count: number | null;
+  }>(
+    `SELECT
+       SUM(CASE WHEN status = 'confirmed' AND direction = 'credit'
+                 AND category NOT IN ${MOVED} THEN amount_paise ELSE 0 END) AS inflow,
+       SUM(CASE WHEN status = 'confirmed' AND direction = 'debit'
+                 AND category NOT IN ${MOVED} THEN amount_paise ELSE 0 END) AS outflow,
+       SUM(CASE WHEN status = 'confirmed'
+                 AND category IN ${MOVED} THEN amount_paise ELSE 0 END) AS moved,
+       SUM(CASE WHEN status = 'pending' AND direction = 'credit'
+                 AND category NOT IN ${MOVED} THEN amount_paise ELSE 0 END) AS pending_in,
+       SUM(CASE WHEN status = 'pending' AND direction = 'debit'
+                 AND category NOT IN ${MOVED} THEN amount_paise ELSE 0 END) AS pending_out,
+       SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count
+     FROM transactions
+     WHERE occurred_at >= ?`,
+    [from]
+  );
+
+  return {
+    inflow: row?.inflow ?? 0,
+    outflow: row?.outflow ?? 0,
+    moved: row?.moved ?? 0,
+    pendingNet: (row?.pending_in ?? 0) - (row?.pending_out ?? 0),
+    pendingCount: row?.pending_count ?? 0,
+  };
+}
+
+export type BalanceStanding = {
+  snapshot: BalanceSnapshot;
+  flow: BalanceFlow;
+  /** The balance the confirmed rows imply. */
+  balance: number;
+  /** The same figure if the unreviewed rows turn out to be real too. */
+  balanceWithPending: number;
+};
+
+/** The current balance, or null while no reading has been taken. */
+export async function balanceStanding(db: SQLiteDatabase): Promise<BalanceStanding | null> {
+  const snapshot = await latestBalanceSnapshot(db);
+  if (!snapshot) return null;
+
+  const flow = await flowSince(db, snapshot.as_of);
+  return {
+    snapshot,
+    flow,
+    balance: projectBalance(snapshot.amount_paise, flow),
+    balanceWithPending: projectBalanceWithPending(snapshot.amount_paise, flow),
   };
 }
 

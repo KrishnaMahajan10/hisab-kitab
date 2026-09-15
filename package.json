@@ -47,7 +47,8 @@
     "test:csv": "tsx src/import/csv.test.ts",
     "test:table": "tsx src/import/table.test.ts",
     "test:rules": "tsx src/parse/rules.test.ts",
-    "test:splits": "tsx src/splits.test.ts"
+    "test:splits": "tsx src/splits.test.ts",
+    "test:balance": "tsx src/balance.test.ts"
   },
   "private": true
 }

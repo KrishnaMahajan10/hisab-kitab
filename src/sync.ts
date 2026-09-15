@@ -142,12 +142,21 @@ export async function drainCaptures(db: SQLiteDatabase): Promise<DrainResult> {
   return { imported, skipped };
 }
 
-export async function backfillLastDays(db: SQLiteDatabase, days: number): Promise<DrainResult> {
-  const since = Date.now() - days * 24 * 60 * 60 * 1000;
+/**
+ * Scans the SMS already on the phone from a moment onwards and queues anything
+ * that looks like a transaction. Taking a timestamp rather than a number of days
+ * lets the caller line the scan up with something meaningful — the start of your
+ * cycle, say — instead of a rolling window that cuts across it.
+ */
+export async function backfillSince(db: SQLiteDatabase, since: number): Promise<DrainResult> {
   try {
     await HisabCapture.backfillSms(since, 2000);
   } catch {
     return { imported: 0, skipped: 0 };
   }
   return drainCaptures(db);
+}
+
+export async function backfillLastDays(db: SQLiteDatabase, days: number): Promise<DrainResult> {
+  return backfillSince(db, Date.now() - days * 24 * 60 * 60 * 1000);
 }
