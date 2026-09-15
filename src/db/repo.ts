@@ -8,6 +8,7 @@ import {
 } from '../parse/categorize';
 import { captureOrigin, type CaptureOrigin } from '../labels';
 import {
+  EMPTY_FLOW,
   projectBalance,
   projectBalanceWithPending,
   type BalanceFlow,
@@ -762,6 +763,7 @@ export async function rangeSummary(
 
 export type BalanceSnapshot = {
   id: number;
+  account_id: number | null;
   amount_paise: number;
   as_of: number;
   note: string | null;
@@ -769,25 +771,45 @@ export type BalanceSnapshot = {
 };
 
 /**
- * The reading the running balance is built on: the most recent one by the
- * moment it describes, and by insert order when two describe the same moment.
+ * The reading a running balance is built on: the most recent one by the moment
+ * it describes, and by insert order when two describe the same moment.
+ *
+ * A null account is the overall reading — everything you own — and it is a
+ * different thing from the sum of the accounts. It counts every payment,
+ * including the ones whose message never named a card, so it is the figure that
+ * cannot quietly drift.
  */
 export async function latestBalanceSnapshot(
-  db: SQLiteDatabase
+  db: SQLiteDatabase,
+  accountId: number | null = null
 ): Promise<BalanceSnapshot | null> {
+  const scope = accountId === null ? 'account_id IS NULL' : 'account_id = ?';
   return db.getFirstAsync<BalanceSnapshot>(
-    'SELECT * FROM balance_snapshots ORDER BY as_of DESC, id DESC LIMIT 1'
+    `SELECT * FROM balance_snapshots WHERE ${scope} ORDER BY as_of DESC, id DESC LIMIT 1`,
+    accountId === null ? [] : [accountId]
   );
 }
 
 export async function recordBalanceSnapshot(
   db: SQLiteDatabase,
-  input: { amountPaise: number; asOf: number; note?: string | null }
+  input: {
+    amountPaise: number;
+    asOf: number;
+    /** Null records the overall reading rather than one account's. */
+    accountId?: number | null;
+    note?: string | null;
+  }
 ): Promise<number> {
   const result = await db.runAsync(
-    `INSERT INTO balance_snapshots (amount_paise, as_of, note, created_at)
-     VALUES (?, ?, ?, ?)`,
-    [Math.round(input.amountPaise), input.asOf, input.note ?? null, Date.now()]
+    `INSERT INTO balance_snapshots (account_id, amount_paise, as_of, note, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+    [
+      input.accountId ?? null,
+      Math.round(input.amountPaise),
+      input.asOf,
+      input.note ?? null,
+      Date.now(),
+    ]
   );
   return result.lastInsertRowId;
 }
@@ -795,6 +817,16 @@ export async function recordBalanceSnapshot(
 export async function deleteBalanceSnapshot(db: SQLiteDatabase, id: number): Promise<void> {
   await db.runAsync('DELETE FROM balance_snapshots WHERE id = ?', [id]);
 }
+
+/**
+ * Which rows a flow covers. An account's own balance may only move on payments
+ * actually attributed to it, while the overall reading sees everything — the
+ * difference between the two is exactly what `unassigned` reports.
+ */
+export type FlowScope =
+  | { kind: 'everything' }
+  | { kind: 'account'; accountId: number }
+  | { kind: 'unassigned' };
 
 /**
  * Everything that has happened to your money since a reading was taken.
@@ -805,7 +837,19 @@ export async function deleteBalanceSnapshot(db: SQLiteDatabase, id: number): Pro
  * separately and never applied, so a card bill cannot take the same money off
  * twice after the card's own spends were already counted.
  */
-export async function flowSince(db: SQLiteDatabase, from: number): Promise<BalanceFlow> {
+export async function flowSince(
+  db: SQLiteDatabase,
+  from: number,
+  scope: FlowScope = { kind: 'everything' }
+): Promise<BalanceFlow> {
+  const where =
+    scope.kind === 'account'
+      ? ' AND account_id = ?'
+      : scope.kind === 'unassigned'
+        ? ' AND account_id IS NULL'
+        : '';
+  const params = scope.kind === 'account' ? [from, scope.accountId] : [from];
+
   const row = await db.getFirstAsync<{
     inflow: number | null;
     outflow: number | null;
@@ -827,8 +871,8 @@ export async function flowSince(db: SQLiteDatabase, from: number): Promise<Balan
                  AND category NOT IN ${MOVED} THEN amount_paise ELSE 0 END) AS pending_out,
        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count
      FROM transactions
-     WHERE occurred_at >= ?`,
-    [from]
+     WHERE occurred_at >= ?${where}`,
+    params
   );
 
   return {
@@ -861,6 +905,70 @@ export async function balanceStanding(db: SQLiteDatabase): Promise<BalanceStandi
     balance: projectBalance(snapshot.amount_paise, flow),
     balanceWithPending: projectBalanceWithPending(snapshot.amount_paise, flow),
   };
+}
+
+export type AccountStanding = {
+  account: Account;
+  /** Null until a balance has been set for this account. */
+  snapshot: BalanceSnapshot | null;
+  flow: BalanceFlow;
+  /** Null while no reading exists — an unknown balance, not a zero one. */
+  balance: number | null;
+};
+
+/**
+ * Each account's own balance, built the same way as the overall one but seeing
+ * only the payments attributed to that account.
+ *
+ * An account with no reading yet reports a null balance rather than zero. The
+ * two are not the same thing, and showing ₹0.00 for "not set yet" is how a
+ * ledger starts lying.
+ */
+export async function accountStandings(db: SQLiteDatabase): Promise<AccountStanding[]> {
+  const accounts = await listAccounts(db);
+
+  const standings: AccountStanding[] = [];
+  for (const account of accounts) {
+    const snapshot = await latestBalanceSnapshot(db, account.id);
+    if (!snapshot) {
+      standings.push({ account, snapshot: null, flow: EMPTY_FLOW, balance: null });
+      continue;
+    }
+    const flow = await flowSince(db, snapshot.as_of, {
+      kind: 'account',
+      accountId: account.id,
+    });
+    standings.push({
+      account,
+      snapshot,
+      flow,
+      balance: projectBalance(snapshot.amount_paise, flow),
+    });
+  }
+  return standings;
+}
+
+export type UnassignedStanding = { since: number; flow: BalanceFlow };
+
+/**
+ * What has moved without landing on any account since the earliest reading.
+ *
+ * Only an SMS naming a card gets attributed automatically, so UPI and wallet
+ * notifications usually arrive with no account at all. That money is real and
+ * has to be visible somewhere, or the per-account figures would quietly add up
+ * to more than you have. Returns null when no reading has been taken yet, since
+ * there is no window to report over.
+ */
+export async function unassignedStanding(
+  db: SQLiteDatabase
+): Promise<UnassignedStanding | null> {
+  const earliest = await db.getFirstAsync<{ as_of: number | null }>(
+    'SELECT MIN(as_of) AS as_of FROM balance_snapshots'
+  );
+  const since = earliest?.as_of;
+  if (typeof since !== 'number') return null;
+
+  return { since, flow: await flowSince(db, since, { kind: 'unassigned' }) };
 }
 
 export async function getSetting(
